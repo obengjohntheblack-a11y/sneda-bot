@@ -263,7 +263,7 @@ const getCart = (userId) => {
 }
 
 const NUMBER_WORDS = /\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|dozen|twenty|thirty|forty|fifty|hundred)\b/i
-const isBareChoice = (m) => /^\s*\d{1,2}\s*[.)]?\s*$/.test(m)
+const isBareChoice = (m) => /^\s*(?:option|number|no\.?|choice|#)?\s*\d{1,2}\s*[.)]?\s*(?:please|pls|plz|thanks|thank you)?\s*[.!]*\s*$/i.test(m)
 const isPaymentOnly = (m) =>
     /(momo|mobile money|cash|visa|master ?card|telecel|\bat money\b|\bpay\b|payment)/i.test(m) && !/\d/.test(m)
 
@@ -439,7 +439,7 @@ STORE INFORMATION:
 - Opening Hours: Mon–Sat (8:00 AM – 9:00 PM), Sun (10:00 AM – 6:00 PM GMT)
 - Delivery: Same-day delivery across Greater Accra for orders placed before 2:00 PM.
 - Payment Options: Mobile Money (MTN MoMo, Telecel Cash, AT Money), Visa/Mastercard, or Cash on Delivery.
-- Payment details: ${PAYMENT_DETAILS || 'NOT SET. If asked where to send payment, say a sales representative will share the payment details. Never invent account or MoMo numbers.'}
+- Payment details: ${PAYMENT_DETAILS || `NOT SET. Say the payment details are not available in this chat yet and ask the customer to contact the store${STORE_PHONE ? ' on ' + STORE_PHONE : ' through the website'}. Never promise that a representative will reach out. Never invent account, MoMo or reference numbers.`}
 
 LIVE DATABASE INVENTORY & STOCK LEVELS:
 ${JSON.stringify(liveInventory, null, 2)}
@@ -452,6 +452,8 @@ STRICT INSTRUCTIONS:
 5. NEVER do arithmetic yourself. If a VERIFIED ORDER CALCULATION section is present, use its exact quantities, line totals and total. When the customer gives a payment method or asks for the total, confirm the order with the full breakdown (quantity × unit price = line total) and the TOTAL FOR ITEMS.
 6. If no VERIFIED ORDER CALCULATION is present and the customer asks for a total, ask which item and how many units they want. If an item shows a stock warning, tell the customer how many are available.
 7. Once the customer has chosen a payment method and you have shown the total, explain how to pay (use the payment details above only) and ask them to reply *PAID* once they have paid, so their invoice can be generated. For Cash on Delivery, ask them to reply *CONFIRM ORDER*.
+8. When the customer asks how to pay or for the payment number, answer that directly using the payment details above. Do not use numbered lists for payment steps (use bullets), and do not mention payment reference numbers unless the payment details include one.
+9. A reply that is only a number or an option, such as '1', '1 please' or 'option 2', is a menu choice, NOT a quantity. Never change or question the order quantity unless the customer clearly says so (for example 'make it 5'). If you are not sure what the number refers to, ask which option they mean.
 `
 
         const chatCompletion = await groq.chat.completions.create({
