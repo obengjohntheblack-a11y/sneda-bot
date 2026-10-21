@@ -7,6 +7,7 @@ import Groq from 'groq-sdk'
 import pg from 'pg'
 import fs from 'node:fs'
 import path from 'node:path'
+import crypto from 'node:crypto'
 
 const { Pool } = pg
 
@@ -87,7 +88,17 @@ async function initDbTables() {
             );
         `)
 
-        console.log("✅ Supabase PostgreSQL tables ('chat_history', 'customer_orders', 'inventory', 'invoices') ready!")
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS wa_session_files (
+                file_name TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `)
+        // Private: blocks Supabase's public API (anon key). The bot connects as the database owner, so it still works.
+        await pool.query('ALTER TABLE wa_session_files ENABLE ROW LEVEL SECURITY')
+
+        console.log("✅ Supabase PostgreSQL tables ('chat_history', 'customer_orders', 'inventory', 'invoices', 'wa_session_files') ready!")
     } catch (err) {
         console.error("❌ Error initializing Supabase database tables:", err.message)
     }
@@ -136,6 +147,67 @@ async function logCustomerOrderToPg(userId, orderDetails) {
         console.log(`📦 Customer order logged in Supabase for user: ${userId}`)
     } catch (err) {
         console.error("❌ Error logging customer order to PG:", err.message)
+    }
+}
+
+// =============================================================
+// 💾 WHATSAPP SESSION BACKUP — keeps you logged in on hosts that wipe their disk (e.g. Render free)
+// =============================================================
+const SESSION_DIR = path.resolve('bot_sessions')
+const syncedFiles = new Map() // file name -> content already saved in Supabase
+let sessionSyncRunning = false
+
+async function restoreSessionFromDb() {
+    try {
+        const res = await pool.query('SELECT file_name, content FROM wa_session_files')
+        if (!res.rows.length) {
+            console.log('ℹ️ No saved WhatsApp session in Supabase yet (a QR code will be needed once).')
+            return
+        }
+        fs.mkdirSync(SESSION_DIR, { recursive: true })
+        for (const row of res.rows) {
+            fs.writeFileSync(path.join(SESSION_DIR, path.basename(row.file_name)), row.content, 'utf8')
+            syncedFiles.set(path.basename(row.file_name), row.content)
+        }
+        console.log(`✅ Restored WhatsApp session (${res.rows.length} files) from Supabase`)
+    } catch (err) {
+        console.error('❌ Could not restore WhatsApp session:', err.message)
+    }
+}
+
+async function backupSessionToDb() {
+    if (sessionSyncRunning || !fs.existsSync(SESSION_DIR)) return
+    sessionSyncRunning = true
+    try {
+        const files = fs.readdirSync(SESSION_DIR).filter((f) => f.endsWith('.json'))
+
+        for (const file of files) {
+            let content
+            try {
+                content = fs.readFileSync(path.join(SESSION_DIR, file), 'utf8')
+                JSON.parse(content) // skip files that are still being written
+            } catch {
+                continue
+            }
+            if (syncedFiles.get(file) === content) continue
+            await pool.query(
+                `INSERT INTO wa_session_files (file_name, content) VALUES ($1, $2)
+                 ON CONFLICT (file_name) DO UPDATE SET content = EXCLUDED.content, updated_at = NOW()`,
+                [file, content]
+            )
+            syncedFiles.set(file, content)
+        }
+
+        for (const file of [...syncedFiles.keys()]) {
+            if (!files.includes(file)) {
+                await pool.query('DELETE FROM wa_session_files WHERE file_name = $1', [file])
+                syncedFiles.delete(file)
+            }
+        }
+    } catch (err) {
+        console.error('❌ WhatsApp session backup failed:', err.message)
+    } finally {
+        sessionSyncRunning = false
     }
 }
 
@@ -680,7 +752,7 @@ const orderPromptFlow = addKeyword(EVENTS.ACTION)
         { capture: true },
         async (ctx, { provider, flowDynamic, gotoFlow }) => {
             if (isGreeting(ctx.body)) { userCarts.delete(ctx.from); return gotoFlow(welcomeFlow) }
-            if (shouldInvoice(ctx.from, ctx.body)) return gotoFlow(invoiceFlow)
+        if (shouldInvoice(ctx.from, ctx.body)) return gotoFlow(invoiceFlow)
 
             await simulateTyping(ctx, provider, 2000)
             await logCustomerOrderToPg(ctx.from, ctx.body)
@@ -885,40 +957,11 @@ const globalFallbackFlow = addKeyword(EVENTS.WELCOME)
     })
 
 // =============================================================
-// ❤️ HEALTH CHECK — for UptimeRobot (GET or HEAD /health)
-// =============================================================
-// Set to true if you also want UptimeRobot to alert you when WhatsApp is disconnected
-const HEALTH_FAILS_IF_WHATSAPP_DOWN = false
-
-function createHealthHandler(provider) {
-    return async (req, res) => {
-        let database = 'up'
-        try {
-            const result = await withTimeout(pool.query('SELECT 1'), 5000)
-            if (!result) database = 'down' // timed out
-        } catch {
-            database = 'down'
-        }
-
-        const whatsapp = provider?.vendor?.user ? 'connected' : 'disconnected'
-        const ok = database === 'up' && (!HEALTH_FAILS_IF_WHATSAPP_DOWN || whatsapp === 'connected')
-
-        res.writeHead(ok ? 200 : 503, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({
-            status: ok ? 'ok' : 'degraded',
-            uptime_seconds: Math.round(process.uptime()),
-            database,
-            whatsapp,
-            time: new Date().toISOString()
-        }))
-    }
-}
-
-// =============================================================
 // 🚀 7. BOT INITIALIZATION
 // =============================================================
 const main = async () => {
     await initDbTables()
+    await restoreSessionFromDb() // must run before the WhatsApp provider starts
 
     const adapterFlow = createFlow([
         globalFallbackFlow,
@@ -947,15 +990,102 @@ const main = async () => {
         queue: { timeout: 45000, concurrencyLimit: 50 }
     })
 
-    // Health endpoint for UptimeRobot (it may use GET or HEAD)
-    const healthHandler = createHealthHandler(adapterProvider)
-    adapterProvider.server.get('/health', healthHandler)
-    adapterProvider.server.head('/health', healthHandler)
+    // ---- Health endpoints (for UptimeRobot) ----
+    const sendJson = (res, status, body) => {
+        res.writeHead(status, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(body))
+    }
 
-    // Hosts like Railway/Render/Northflank give you the port in the PORT variable
+    // /health      -> 200 as long as the bot process is running (use this to keep a host awake)
+    const healthHandler = (_req, res) =>
+        sendJson(res, 200, { status: 'ok', uptime_seconds: Math.round(process.uptime()) })
+
+    // /health/full -> 200 only if Supabase AND WhatsApp are both working, otherwise 503 (use this for alerts)
+    const fullHealthHandler = async (_req, res) => {
+        let dbOk = false
+        try {
+            await withTimeout(pool.query('SELECT 1').then(() => { dbOk = true }), 5000)
+        } catch {
+            dbOk = false
+        }
+        const whatsappOk = !!adapterProvider.vendor?.user
+        sendJson(res, dbOk && whatsappOk ? 200 : 503, {
+            status: dbOk && whatsappOk ? 'ok' : 'degraded',
+            database: dbOk ? 'up' : 'down',
+            whatsapp: whatsappOk ? 'connected' : 'disconnected',
+            uptime_seconds: Math.round(process.uptime())
+        })
+    }
+
+    // UptimeRobot may use GET or HEAD requests, so both are supported
+    for (const method of ['get', 'head']) {
+        adapterProvider.server[method]('/health', healthHandler)
+        adapterProvider.server[method]('/health/full', fullHealthHandler)
+    }
+
+    // ---- QR page: link WhatsApp from any browser (no need to read the Render logs) ----
+    const QR_KEY = process.env.QR_KEY || crypto.randomBytes(6).toString('hex')
+    const qrAllowed = (req) => new URL(req.url, 'http://x').searchParams.get('key') === QR_KEY
+    const sendHtml = (res, status, html) => {
+        res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
+        res.end(html)
+    }
+    const qrPage = (inner, refresh) =>
+        `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">` +
+        (refresh ? `<meta http-equiv="refresh" content="${refresh}">` : '') +
+        `<body style="font-family:sans-serif;text-align:center;padding:24px">${inner}</body>`
+
+    adapterProvider.server.get('/qr', (req, res) => {
+        if (!qrAllowed(req)) return sendHtml(res, 403, 'Forbidden')
+        if (adapterProvider.vendor?.user) {
+            return sendHtml(res, 200, qrPage('<h2>✅ WhatsApp is connected</h2><p>No QR code needed.</p>'))
+        }
+        if (!fs.existsSync(path.resolve('bot.qr.png'))) {
+            return sendHtml(res, 200, qrPage('<h2>⏳ Waiting for a QR code…</h2><p>This page refreshes by itself.</p>', 5))
+        }
+        sendHtml(res, 200, qrPage(
+            `<h2>Scan with WhatsApp</h2><p>Settings → Linked devices → Link a device</p>` +
+            `<img src="/qr.png?key=${QR_KEY}&t=${Date.now()}" style="width:min(320px,90vw)">` +
+            `<p>The code changes every ~20 seconds, so this page refreshes automatically.</p>`, 10))
+    })
+
+    adapterProvider.server.get('/qr.png', (req, res) => {
+        const file = path.resolve('bot.qr.png')
+        if (!qrAllowed(req) || !fs.existsSync(file)) {
+            res.writeHead(404)
+            return res.end()
+        }
+        res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' })
+        res.end(fs.readFileSync(file))
+    })
+
+    // Save the WhatsApp login to Supabase every 15 seconds (only changed files are uploaded)
+    setInterval(backupSessionToDb, 15000)
+
+    // ---- Keep-alive: pings this bot's own public URL every 5 minutes so Render's free plan does not put it to sleep ----
+    // Render sets RENDER_EXTERNAL_URL automatically. You can also set PUBLIC_URL yourself. Off when running on your PC.
+    const KEEP_ALIVE_URL = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '')
+    if (KEEP_ALIVE_URL) {
+        const pingSelf = async () => {
+            try {
+                const res = await fetch(`${KEEP_ALIVE_URL}/health`, { signal: AbortSignal.timeout(15000) })
+                if (!res.ok) console.warn(`⚠️ Keep-alive ping returned status ${res.status}`)
+            } catch (err) {
+                console.warn('⚠️ Keep-alive ping failed:', err?.message)
+            }
+        }
+        setInterval(pingSelf, 5 * 60 * 1000)
+        console.log(`⏰ Keep-alive on: pinging ${KEEP_ALIVE_URL}/health every 5 minutes`)
+    } else {
+        console.log('⏰ Keep-alive off (no RENDER_EXTERNAL_URL or PUBLIC_URL found)')
+    }
+
+    // Hosts like Render/Northflank give the port through the PORT variable
     const PORT = Number(process.env.PORT) || 3008
     httpServer(PORT)
-    console.log(`🌐 Server running on port ${PORT}. Health check: /health. Bot connected live to Supabase PostgreSQL!`)
+    console.log(`🌐 Server running on port ${PORT}. Bot connected live to Supabase PostgreSQL!`)
+    console.log(`❤️ Health checks: /health (alive) and /health/full (database + WhatsApp)`)
+    console.log(`📱 To link WhatsApp, open: https://YOUR-APP.onrender.com/qr?key=${QR_KEY}`)
 }
 
 main()
