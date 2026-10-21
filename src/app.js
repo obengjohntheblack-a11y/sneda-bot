@@ -236,13 +236,13 @@ const DIGITAL_CATALOG_URL = 'https://www.snedashopping.com/'
 // Shop details printed on invoices (edit these)
 const STORE_NAME = 'SNEDA Shopping Center'
 const STORE_ADDRESS = 'Accra, Ghana'
-const STORE_PHONE = '' // optional, e.g. '+233 24 000 0000'
+const STORE_PHONE = '0543812261' // optional, e.g. '+233 24 000 0000'
 const OWNER_NUMBER = '' // optional: WhatsApp number that gets a copy of every invoice, e.g. '233241234567'
 const REPORT_TIME = '21:30' // daily sales report time, Accra time (24-hour HH:MM)
 const REPORT_FORMATS = ['xlsx', 'pdf'] // choose any of: 'xlsx' (Excel), 'pdf'
 const HUMAN_TAKEOVER = true // pause the bot in a chat when a person replies from the phone
 const HUMAN_PAUSE_MINUTES = 30 // the bot stays quiet until the person has been silent this long
-const PAYMENT_DETAILS = '' // e.g. 'MTN MoMo: 024 000 0000 (SNEDA Shopping Center)'
+const PAYMENT_DETAILS = '0257575551' // e.g. 'MTN MoMo: 024 000 0000 (SNEDA Shopping Center)'
 
 // Owner numbers (OWNER_NUMBER can hold several, separated by commas) receive order alerts and daily reports
 const OWNER_NUMBERS = OWNER_NUMBER.split(',').map((n) => n.replace(/\D/g, '')).filter(Boolean)
@@ -252,7 +252,6 @@ const isOwner = (from) => OWNER_NUMBERS.includes(String(from).replace(/\D/g, '')
 // ⚙️ 3. GROQ AI WITH SUPABASE LIVE INVENTORY & MEMORY
 // =============================================================
 const apiKey = process.env.GROQ_API_KEY ||
-console.log('Groq key loaded:', !!apiKey)
 const groq = apiKey ? new Groq({ apiKey, timeout: 20000, maxRetries: 1 }) : null
 
 // =============================================================
