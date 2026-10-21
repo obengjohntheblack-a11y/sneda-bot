@@ -236,13 +236,13 @@ const DIGITAL_CATALOG_URL = 'https://www.snedashopping.com/'
 // Shop details printed on invoices (edit these)
 const STORE_NAME = 'SNEDA Shopping Center'
 const STORE_ADDRESS = 'Accra, Ghana'
-const STORE_PHONE = '0543812261' // optional, e.g. '+233 24 000 0000'
+const STORE_PHONE = '' // optional, e.g. '+233 24 000 0000'
 const OWNER_NUMBER = '' // optional: WhatsApp number that gets a copy of every invoice, e.g. '233241234567'
 const REPORT_TIME = '21:30' // daily sales report time, Accra time (24-hour HH:MM)
 const REPORT_FORMATS = ['xlsx', 'pdf'] // choose any of: 'xlsx' (Excel), 'pdf'
 const HUMAN_TAKEOVER = true // pause the bot in a chat when a person replies from the phone
 const HUMAN_PAUSE_MINUTES = 30 // the bot stays quiet until the person has been silent this long
-const PAYMENT_DETAILS = 'MTN MoMo: 0257575551 (SNEDA Shopping Center)' // shown to customers exactly as written
+const PAYMENT_DETAILS = '' // e.g. 'MTN MoMo: 024 000 0000 (SNEDA Shopping Center)'
 
 // Owner numbers (OWNER_NUMBER can hold several, separated by commas) receive order alerts and daily reports
 const OWNER_NUMBERS = OWNER_NUMBER.split(',').map((n) => n.replace(/\D/g, '')).filter(Boolean)
@@ -251,7 +251,8 @@ const isOwner = (from) => OWNER_NUMBERS.includes(String(from).replace(/\D/g, '')
 // =============================================================
 // ⚙️ 3. GROQ AI WITH SUPABASE LIVE INVENTORY & MEMORY
 // =============================================================
-const apiKey = process.env.GROQ_API_KEY
+const apiKey = process.env.GROQ_API_KEY || 
+console.log('Groq key loaded:', !!apiKey)
 const groq = apiKey ? new Groq({ apiKey, timeout: 20000, maxRetries: 1 }) : null
 
 // =============================================================
@@ -297,26 +298,6 @@ const detectPayment = (m) => {
     if (/(visa|master ?card|\bcard\b)/i.test(m)) return 'Card'
     return null
 }
-
-// Customer is asking where to send the money / for the payment number
-const asksForPaymentNumber = (m) =>
-    /\b(number|account|details|momo no|where (?:do|should|can) i (?:pay|send)|how (?:do|can|should) i pay)\b/i.test(m)
-
-// Payment instructions are written by the code (not the AI), so the number is always correct
-const buildPaymentReply = (method, total) => {
-    if (method === 'Mobile Money') {
-        return [
-            `Great! You'll pay by *Mobile Money*.`,
-            '',
-            `• *Amount:* ${money(total)}`,
-            `• *Send to:* ${PAYMENT_DETAILS}`,
-            '',
-            `When you've sent the money, reply *PAID* and we'll generate your invoice.`
-        ].join('\n')
-    }
-    return null
-}
-
 function noteCartDetails(userId, message) {
     const cart = getCart(userId)
     const method = detectPayment(message)
@@ -522,23 +503,11 @@ async function getGroqCompletion(userId, userMessage) {
         await saveChatMessageToPg(userId, 'user', userMessage)
 
         let orderBlock = ''
-        let calc = null
         if (getCart(userId) || looksLikeOrder(userMessage, history)) {
-            calc = await calculateOrder(userId, history, userMessage, liveInventory)
+            const calc = await calculateOrder(userId, history, userMessage, liveInventory)
             if (calc) orderBlock = formatOrderBlock(calc)
         }
         noteCartDetails(userId, userMessage)
-
-        // Payment instructions are written by the code, so the number is always correct
-        const cartNow = getCart(userId)
-        if (
-            PAYMENT_DETAILS && calc && cartNow?.payment === 'Mobile Money' &&
-            (isPaymentOnly(userMessage) || asksForPaymentNumber(userMessage))
-        ) {
-            const reply = buildPaymentReply('Mobile Money', calc.total)
-            await saveChatMessageToPg(userId, 'assistant', reply)
-            return reply
-        }
 
         const dynamicSystemPrompt = `
 You are SNEDA Shopping Center's friendly, sharp, and accurate sales assistant located in Accra, Ghana.
@@ -560,7 +529,7 @@ STRICT INSTRUCTIONS:
 4. Keep answers conversational, warm, and optimized for WhatsApp. Use WhatsApp formatting only: *single asterisks* for bold (prices, item names, totals). NEVER use **double asterisks**, # headings, markdown tables or --- lines.
 5. NEVER do arithmetic yourself. If a VERIFIED ORDER CALCULATION section is present, use its exact quantities, line totals and total. When the customer gives a payment method or asks for the total, confirm the order with the full breakdown (quantity × unit price = line total) and the TOTAL FOR ITEMS.
 6. If no VERIFIED ORDER CALCULATION is present and the customer asks for a total, ask which item and how many units they want. If an item shows a stock warning, tell the customer how many are available.
-7. Once the customer has chosen a payment method and you have shown the total, explain how to pay (use the payment details above only) and ask them to reply *PAID* once they have paid, so their invoice can be generated. For Cash on Delivery, ask them to reply *CONFIRM ORDER*. NEVER say the payment number is on the website or tell the customer to look it up elsewhere. The payment details above are the only ones to use.
+7. Once the customer has chosen a payment method and you have shown the total, explain how to pay (use the payment details above only) and ask them to reply *PAID* once they have paid, so their invoice can be generated. For Cash on Delivery, ask them to reply *CONFIRM ORDER*.
 8. When the customer asks how to pay or for the payment number, answer that directly using the payment details above. Do not use numbered lists for payment steps (use bullets), and do not mention payment reference numbers unless the payment details include one.
 9. A reply that is only a number or an option, such as '1', '1 please' or 'option 2', is a menu choice, NOT a quantity. Never change or question the order quantity unless the customer clearly says so (for example 'make it 5'). If you are not sure what the number refers to, ask which option they mean.
 10. Do not number your own product lists (use bullets), because customers may reply with a number from the store's numbered menu.
@@ -1407,9 +1376,9 @@ const orderPromptFlow = addKeyword(EVENTS.ACTION)
         '🛒 *Great choice!* Please reply with the *item number* or *item name*, the *quantity*, your *delivery location* in Accra, and your *payment method* (e.g., Mobile Money or Cash on Delivery):',
         { capture: true },
         async (ctx, { provider, flowDynamic, gotoFlow }) => {
-            if (isPaused(ctx)) return notePausedMessage(ctx)
+        if (isPaused(ctx)) return notePausedMessage(ctx)
             if (isGreeting(ctx.body)) { userCarts.delete(ctx.from); userLists.delete(ctx.from); return gotoFlow(welcomeFlow) }
-            if (shouldInvoice(ctx.from, ctx.body)) return gotoFlow(invoiceFlow)
+        if (shouldInvoice(ctx.from, ctx.body)) return gotoFlow(invoiceFlow)
 
             await simulateTyping(ctx, provider, 2000)
             await logCustomerOrderToPg(ctx.from, ctx.body)
@@ -1424,7 +1393,7 @@ const categorySelectionFlow = addKeyword(EVENTS.ACTION)
         'Which category would you like to explore?\n\n1️⃣ *Groceries*\n2️⃣ *Electronics*\n3️⃣ *View Official Web Store*',
         { capture: true },
         async (ctx, { gotoFlow, provider, flowDynamic }) => {
-            if (isPaused(ctx)) return notePausedMessage(ctx)
+        if (isPaused(ctx)) return notePausedMessage(ctx)
             const input = ctx.body.trim().toLowerCase()
             if (isGreeting(input)) { userCarts.delete(ctx.from); userLists.delete(ctx.from); return gotoFlow(welcomeFlow) }
 
@@ -1475,7 +1444,7 @@ const retailFlow = addKeyword(EVENTS.ACTION)
         ].join('\n'),
         { capture: true },
         async (ctx, { gotoFlow, provider, flowDynamic }) => {
-            if (isPaused(ctx)) return notePausedMessage(ctx)
+        if (isPaused(ctx)) return notePausedMessage(ctx)
             const selection = ctx.body.trim().toLowerCase()
             if (isGreeting(selection)) { userCarts.delete(ctx.from); userLists.delete(ctx.from); return gotoFlow(welcomeFlow) }
 
@@ -1503,7 +1472,7 @@ const wholesaleFlow = addKeyword(EVENTS.ACTION)
         ].join('\n'),
         { capture: true },
         async (ctx, { gotoFlow, provider, flowDynamic }) => {
-            if (isPaused(ctx)) return notePausedMessage(ctx)
+        if (isPaused(ctx)) return notePausedMessage(ctx)
             if (isGreeting(ctx.body)) { userCarts.delete(ctx.from); userLists.delete(ctx.from); return gotoFlow(welcomeFlow) }
 
             await simulateTyping(ctx, provider, 2000)
@@ -1524,7 +1493,7 @@ const supportFlow = addKeyword(EVENTS.ACTION)
         ].join('\n'),
         { capture: true },
         async (ctx, { gotoFlow, provider, flowDynamic }) => {
-            if (isPaused(ctx)) return notePausedMessage(ctx)
+        if (isPaused(ctx)) return notePausedMessage(ctx)
             if (isGreeting(ctx.body)) { userCarts.delete(ctx.from); userLists.delete(ctx.from); return gotoFlow(welcomeFlow) }
 
             await simulateTyping(ctx, provider, 2000)
@@ -1563,7 +1532,7 @@ const deliveryDetailsFlow = addKeyword(EVENTS.ACTION)
         '📍 Almost done! Please send your *delivery location* in Accra (area and nearest landmark) so we can complete your invoice:',
         { capture: true },
         async (ctx, { gotoFlow }) => {
-            if (isPaused(ctx)) return notePausedMessage(ctx)
+        if (isPaused(ctx)) return notePausedMessage(ctx)
             if (isGreeting(ctx.body)) { userCarts.delete(ctx.from); userLists.delete(ctx.from); return gotoFlow(welcomeFlow) }
             const cart = getCart(ctx.from)
             if (cart) cart.location = ctx.body.trim()
@@ -1590,7 +1559,7 @@ const welcomeFlow = addKeyword(EVENTS.ACTION)
         ].join('\n'),
         { capture: true },
         async (ctx, { gotoFlow, provider, flowDynamic }) => {
-            if (isPaused(ctx)) return notePausedMessage(ctx)
+        if (isPaused(ctx)) return notePausedMessage(ctx)
             const userInput = ctx.body.trim().toLowerCase()
 
             if (userInput === '1' || userInput.includes('retail')) {
