@@ -219,9 +219,9 @@ const DIGITAL_CATALOG_URL = 'https://www.snedashopping.com/'
 // Shop details printed on invoices (edit these)
 const STORE_NAME = 'SNEDA Shopping Center'
 const STORE_ADDRESS = 'Accra, Ghana'
-const STORE_PHONE = '' // optional, e.g. '+233 24 000 0000'
+const STORE_PHONE = '0257575551' // optional, e.g. '+233 24 000 0000'
 const OWNER_NUMBER = '' // optional: WhatsApp number that gets a copy of every invoice, e.g. '233241234567'
-const PAYMENT_DETAILS = '' // e.g. 'MTN MoMo: 024 000 0000 (SNEDA Shopping Center)'
+const PAYMENT_DETAILS = 'MTN MoMo Merchant ID: 123456 or MoMo Number:0257575551(SNEDA Shopping Center)' // e.g. 'MTN MoMo: 024 000 0000 (SNEDA Shopping Center)'
 
 // =============================================================
 // ⚙️ 3. GROQ AI WITH SUPABASE LIVE INVENTORY & MEMORY
@@ -439,7 +439,7 @@ STORE INFORMATION:
 - Opening Hours: Mon–Sat (8:00 AM – 9:00 PM), Sun (10:00 AM – 6:00 PM GMT)
 - Delivery: Same-day delivery across Greater Accra for orders placed before 2:00 PM.
 - Payment Options: Mobile Money (MTN MoMo, Telecel Cash, AT Money), Visa/Mastercard, or Cash on Delivery.
-- Payment details: ${PAYMENT_DETAILS || `NOT SET. Say the payment details are not available in this chat yet and ask the customer to contact the store${STORE_PHONE ? ' on ' + STORE_PHONE : ' through the website'}. Never promise that a representative will reach out. Never invent account, MoMo or reference numbers.`}
+- Payment details: ${PAYMENT_DETAILS || `NOT SET. Say the payment details are not available in this chat yet and ask the customer to contact the store${STORE_PHONE ? '0257575771' + STORE_PHONE : ' through the website'}. Never promise that a representative will reach out. Never invent account, MoMo or reference numbers.`}
 
 LIVE DATABASE INVENTORY & STOCK LEVELS:
 ${JSON.stringify(liveInventory, null, 2)}
