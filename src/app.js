@@ -115,7 +115,27 @@ async function initDbTables() {
         `)
         await pool.query('ALTER TABLE bot_pauses ENABLE ROW LEVEL SECURITY')
 
-        console.log("✅ Supabase PostgreSQL tables ('chat_history', 'customer_orders', 'inventory', 'invoices', 'wa_session_files', 'daily_reports', 'bot_pauses') ready!")
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS stock_holds (
+                user_id TEXT NOT NULL,
+                item_name TEXT NOT NULL,
+                quantity INT NOT NULL,
+                expires_at BIGINT NOT NULL,
+                PRIMARY KEY (user_id, item_name)
+            );
+        `)
+        await pool.query('ALTER TABLE stock_holds ENABLE ROW LEVEL SECURITY')
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS customer_carts (
+                user_id TEXT PRIMARY KEY,
+                data JSONB NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        `)
+        await pool.query('ALTER TABLE customer_carts ENABLE ROW LEVEL SECURITY')
+
+        console.log("✅ Supabase PostgreSQL tables ('chat_history', 'customer_orders', 'inventory', 'invoices', 'wa_session_files', 'daily_reports', 'bot_pauses', 'stock_holds', 'customer_carts') ready!")
     } catch (err) {
         console.error("❌ Error initializing Supabase database tables:", err.message)
     }
@@ -145,9 +165,23 @@ async function getChatHistoryFromPg(userId, limit = 12) {
     }
 }
 
-async function getLiveInventoryFromDb() {
+// Returns the inventory with stock_quantity = what is still AVAILABLE to this customer
+// (real stock minus what other customers are holding while they pay).
+async function getLiveInventoryFromDb(forUser = null) {
     try {
-        const res = await pool.query('SELECT category, item_name, price, stock_quantity FROM inventory ORDER BY id')
+        const res = await pool.query(
+            `SELECT i.category, i.item_name, i.price,
+                    GREATEST(i.stock_quantity - COALESCE(h.held, 0), 0)::int AS stock_quantity
+             FROM inventory i
+             LEFT JOIN (
+                 SELECT lower(item_name) AS k, SUM(quantity) AS held
+                 FROM stock_holds
+                 WHERE expires_at > $1 AND user_id <> $2
+                 GROUP BY lower(item_name)
+             ) h ON h.k = lower(i.item_name)
+             ORDER BY i.id`,
+            [Date.now(), forUser || '']
+        )
         return res.rows
     } catch (err) {
         console.error("❌ Error fetching inventory:", err.message)
@@ -283,13 +317,15 @@ const DIGITAL_CATALOG_URL = 'https://www.snedashopping.com/'
 // Shop details printed on invoices (edit these)
 const STORE_NAME = 'SNEDA Shopping Center'
 const STORE_ADDRESS = 'Accra, Ghana'
-const STORE_PHONE = '233244444449' // optional, e.g. '+233 24 000 0000'
-const OWNER_NUMBER = '23354382261' // optional: WhatsApp number that gets a copy of every invoice, e.g. '233241234567'
+const STORE_PHONE = '' // optional, e.g. '+233 24 000 0000'
+const OWNER_NUMBER = '0543812261' // optional: WhatsApp number that gets a copy of every invoice, e.g. '233241234567'
 const REPORT_TIME = '21:30' // daily sales report time, Accra time (24-hour HH:MM)
 const REPORT_FORMATS = ['xlsx', 'pdf'] // choose any of: 'xlsx' (Excel), 'pdf'
 const HUMAN_TAKEOVER = true // pause the bot in a chat when a person replies from the phone
 const HUMAN_PAUSE_MINUTES = 30 // the bot stays quiet until the person has been silent this long
-const PAYMENT_DETAILS = 'We accept Cash on Delivery,Or Customers can pay using our MoMo number 233257575551' // e.g. 'MTN MoMo: 024 000 0000 (SNEDA Shopping Center)'
+const HOLD_MINUTES = 30 // items are reserved for a customer this long while they pay
+const LOW_STOCK_ALERT = 5 // customers see "Only N left", and the owner is warned, at this level or below
+const PAYMENT_DETAILS = '233257575551' // e.g. 'MTN MoMo: 024 000 0000 (SNEDA Shopping Center)'
 
 // Owner numbers (OWNER_NUMBER can hold several, separated by commas) receive order alerts and daily reports
 const OWNER_NUMBERS = OWNER_NUMBER.split(',').map((n) => n.replace(/\D/g, '')).filter(Boolean)
@@ -305,6 +341,7 @@ const groq = apiKey ? new Groq({ apiKey, timeout: 20000, maxRetries: 1 }) : null
 // =============================================================
 // 🧮 ORDER MATHS — done in code, never by the AI
 // =============================================================
+const stockLabel = (n) => (n <= 0 ? '❌ Out of stock' : n <= LOW_STOCK_ALERT ? `⚠️ Only ${n} left` : `Stock: ${n}`)
 const parsePrice = (p) => {
     const n = parseFloat(String(p).replace(/[^0-9.]/g, ''))
     return Number.isFinite(n) ? n : null
@@ -359,9 +396,11 @@ function priceItems(items, inventory) {
         const row = inventory.find((r) => r.item_name.toLowerCase() === it.item_name.toLowerCase())
         const unit = row ? parsePrice(row.price) : null
         if (!row || unit === null) continue
-        const subtotal = round2(unit * it.quantity)
+        const available = Math.max(Number(row.stock_quantity) || 0, 0)
+        const sellable = Math.min(it.quantity, available)
+        const subtotal = round2(unit * sellable) // only what can really be supplied is charged
         total = round2(total + subtotal)
-        lines.push({ item: row.item_name, qty: it.quantity, unit, subtotal, stock: row.stock_quantity, enough: row.stock_quantity >= it.quantity })
+        lines.push({ item: row.item_name, qty: it.quantity, sellable, unit, subtotal, stock: available, enough: available >= it.quantity })
     }
     return lines.length ? { lines, total } : null
 }
@@ -410,6 +449,7 @@ async function calculateOrder(userId, history, userMessage, inventory) {
             const text = (res.choices[0]?.message?.content || '').replace(/```json|```/g, '').trim()
             const parsed = JSON.parse(text || '{}')
             const found = Array.isArray(parsed.items) ? parsed.items : []
+            if (found.length === 0 && saved && /\b(remove|delete|take\s+out|drop|no\s+more)\b/i.test(userMessage)) items = [] // customer removed everything
 
             const clean = []
             for (const it of found) {
@@ -434,17 +474,22 @@ async function calculateOrder(userId, history, userMessage, inventory) {
         }
     }
 
-    if (!items.length) return null
+    if (!items.length) {
+        if (saved) resetCustomer(userId)
+        return null
+    }
     userCarts.set(userId, { ...(saved || {}), items, at: Date.now() })
     return priceItems(items, inventory)
 }
 
 function formatOrderBlock(calc) {
-    const lines = calc.lines.map(
-        (l) =>
-            `- ${l.qty} × ${l.item} @ ${money(l.unit)} = ${money(l.subtotal)}` +
-            (l.enough ? '' : ` ⚠️ ONLY ${l.stock} IN STOCK — tell the customer`)
-    )
+    const lines = calc.lines.map((l) => {
+        if (l.enough) return `- ${l.qty} × ${l.item} @ ${money(l.unit)} = ${money(l.subtotal)}`
+        if (l.sellable > 0) {
+            return `- ${l.item}: customer wants ${l.qty} but ONLY ${l.sellable} ARE AVAILABLE. Priced for ${l.sellable}: ${l.sellable} × ${money(l.unit)} = ${money(l.subtotal)} ⚠️ Tell the customer only ${l.sellable} can be supplied and ask if they want that instead`
+        }
+        return `- ${l.item}: OUT OF STOCK ⚠️ Tell the customer it is not available now and suggest an alternative`
+    })
     return `
 VERIFIED ORDER CALCULATION (calculated by the system — use these exact numbers):
 ${lines.join('\n')}
@@ -537,6 +582,133 @@ function expandListReferences(userId, text) {
     return replaced
 }
 
+// =============================================================
+// 📦 STOCK RESERVATION — stops two customers from buying the same last items
+// =============================================================
+// While a customer is ordering/paying, their items are held for HOLD_MINUTES. Other customers only see what is left.
+// All stock changes run inside a database transaction that locks the item row, so two customers
+// ordering at the same moment are handled one after the other.
+function releaseHolds(userId) {
+    pool.query('DELETE FROM stock_holds WHERE user_id = $1', [userId])
+        .catch((err) => console.error('❌ Could not release held stock:', err.message))
+}
+
+// Forget everything about a customer's current order (cart, shown list, held stock)
+function resetCustomer(userId) {
+    userCarts.delete(userId)
+    userLists.delete(userId)
+    releaseHolds(userId)
+}
+
+// Reserves what is available. Returns Map(item lower-case -> { requested, held, available }) or null if the database failed.
+async function reserveCart(userId, items) {
+    const client = await pool.connect()
+    const result = new Map()
+    try {
+        await client.query('BEGIN')
+        const now = Date.now()
+        const sorted = [...items].sort((a, b) => a.item_name.localeCompare(b.item_name)) // same lock order for everyone
+        for (const it of sorted) {
+            const inv = await client.query('SELECT stock_quantity FROM inventory WHERE lower(item_name) = lower($1) FOR UPDATE', [it.item_name])
+            if (!inv.rows.length) continue
+            const others = await client.query(
+                'SELECT COALESCE(SUM(quantity), 0)::int AS held FROM stock_holds WHERE lower(item_name) = lower($1) AND user_id <> $2 AND expires_at > $3',
+                [it.item_name, userId, now]
+            )
+            const available = Math.max(inv.rows[0].stock_quantity - others.rows[0].held, 0)
+            const held = Math.min(it.quantity, available)
+            if (held > 0) {
+                await client.query(
+                    `INSERT INTO stock_holds (user_id, item_name, quantity, expires_at) VALUES ($1, $2, $3, $4)
+                     ON CONFLICT (user_id, item_name) DO UPDATE SET quantity = EXCLUDED.quantity, expires_at = EXCLUDED.expires_at`,
+                    [userId, it.item_name, held, now + HOLD_MINUTES * 60000]
+                )
+            } else {
+                await client.query('DELETE FROM stock_holds WHERE user_id = $1 AND item_name = $2', [userId, it.item_name])
+            }
+            result.set(it.item_name.toLowerCase(), { requested: it.quantity, held, available })
+        }
+        // release anything the customer removed from the order
+        await client.query('DELETE FROM stock_holds WHERE user_id = $1 AND NOT (item_name = ANY($2::text[]))', [userId, items.map((i) => i.item_name)])
+        await client.query('COMMIT')
+        return result
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {})
+        console.error('❌ Stock reservation failed:', err.message)
+        return null
+    } finally {
+        client.release()
+    }
+}
+
+// Updates the priced lines with what could really be reserved
+function applyReservation(calc, reserved) {
+    let total = 0
+    for (const l of calc.lines) {
+        const r = reserved.get(l.item.toLowerCase())
+        if (r) {
+            l.sellable = r.held
+            l.stock = r.available
+            l.enough = r.held >= l.qty
+            l.subtotal = round2(l.unit * l.sellable)
+        }
+        total = round2(total + l.subtotal)
+    }
+    calc.total = total
+}
+
+// =============================================================
+// 💾 SAVED ORDERS — carts survive a restart of the bot
+// =============================================================
+const persistedCarts = new Map() // userId -> JSON that is already saved in Supabase
+
+async function persistCarts() {
+    for (const [userId, cart] of userCarts) {
+        if (Date.now() - cart.at > CART_TTL_MS) continue
+        const json = JSON.stringify(cart)
+        if (persistedCarts.get(userId) === json) continue
+        try {
+            await pool.query(
+                `INSERT INTO customer_carts (user_id, data) VALUES ($1, $2)
+                 ON CONFLICT (user_id) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
+                [userId, json]
+            )
+            persistedCarts.set(userId, json)
+        } catch (err) {
+            console.error('❌ Could not save a customer order:', err.message)
+        }
+    }
+    for (const userId of [...persistedCarts.keys()]) {
+        if (userCarts.has(userId)) continue
+        try {
+            await pool.query('DELETE FROM customer_carts WHERE user_id = $1', [userId])
+            persistedCarts.delete(userId)
+        } catch (err) {
+            console.error('❌ Could not remove a saved order:', err.message)
+        }
+    }
+}
+
+async function loadCarts() {
+    try {
+        const res = await pool.query('SELECT user_id, data FROM customer_carts')
+        let restored = 0
+        for (const r of res.rows) {
+            const data = typeof r.data === 'string' ? JSON.parse(r.data) : r.data
+            if (data && Date.now() - data.at < CART_TTL_MS) {
+                userCarts.set(r.user_id, data)
+                persistedCarts.set(r.user_id, JSON.stringify(data))
+                restored++
+            } else {
+                await pool.query('DELETE FROM customer_carts WHERE user_id = $1', [r.user_id])
+            }
+        }
+        if (restored) console.log(`🛒 Restored ${restored} unfinished order(s) after the restart`)
+    } catch (err) {
+        console.error('❌ Could not restore saved orders:', err.message)
+    }
+}
+
 async function getGroqCompletion(userId, userMessage) {
     try {
         if (!groq) {
@@ -545,14 +717,21 @@ async function getGroqCompletion(userId, userMessage) {
 
         userMessage = expandListReferences(userId, userMessage) // "3" becomes the 3rd item shown in the list
 
-        const liveInventory = await getLiveInventoryFromDb()
+        const liveInventory = await getLiveInventoryFromDb(userId)
         const history = await getChatHistoryFromPg(userId, 12)
         await saveChatMessageToPg(userId, 'user', userMessage)
 
         let orderBlock = ''
         if (getCart(userId) || looksLikeOrder(userMessage, history)) {
             const calc = await calculateOrder(userId, history, userMessage, liveInventory)
-            if (calc) orderBlock = formatOrderBlock(calc)
+            if (calc) {
+                const cart = getCart(userId)
+                if (cart) {
+                    const reserved = await reserveCart(userId, cart.items) // hold the items for this customer
+                    if (reserved) applyReservation(calc, reserved)
+                }
+                orderBlock = formatOrderBlock(calc)
+            }
         }
         noteCartDetails(userId, userMessage)
 
@@ -567,7 +746,7 @@ STORE INFORMATION:
 - Payment details: ${PAYMENT_DETAILS || `NOT SET. Say the payment details are not available in this chat yet and ask the customer to contact the store${STORE_PHONE ? ' on ' + STORE_PHONE : ' through the website'}. Never promise that a representative will reach out. Never invent account, MoMo or reference numbers.`}
 
 LIVE DATABASE INVENTORY & STOCK LEVELS:
-${JSON.stringify(liveInventory, null, 2)}
+${JSON.stringify(liveInventory.map(({ category, item_name, price, stock_quantity }) => ({ category, item_name, price, stock_quantity })), null, 2)}
 ${orderBlock}
 STRICT INSTRUCTIONS:
 1. Always check the LIVE DATABASE INVENTORY above before answering product questions.
@@ -580,6 +759,8 @@ STRICT INSTRUCTIONS:
 8. When the customer asks how to pay or for the payment number, answer that directly using the payment details above. Do not use numbered lists for payment steps (use bullets), and do not mention payment reference numbers unless the payment details include one.
 9. A reply that is only a number or an option, such as '1', '1 please' or 'option 2', is a menu choice, NOT a quantity. Never change or question the order quantity unless the customer clearly says so (for example 'make it 5'). If you are not sure what the number refers to, ask which option they mean.
 10. Do not number your own product lists (use bullets), because customers may reply with a number from the store's numbered menu.
+11. Never promise more than the stock level shown. Items are reserved for a customer for ${HOLD_MINUTES} minutes while they pay. If an item is out of stock or only some units are available, say so clearly, offer the available quantity or an alternative, and never ask the customer to pay for items that are not available.
+12. If a customer wants to change an order, confirm the change. If they want to cancel an order that already has an invoice, tell them a team member will help them.
 `
 
         const chatCompletion = await groq.chat.completions.create({
@@ -1397,7 +1578,7 @@ async function handleOwnerCommand(text) {
 const orderCaptureFlow = addKeyword(EVENTS.ACTION)
     .addAction({ capture: true }, async (ctx, { provider, flowDynamic, gotoFlow }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
-        if (isGreeting(ctx.body)) { userCarts.delete(ctx.from); userLists.delete(ctx.from); return gotoFlow(welcomeFlow) }
+        if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
         if (shouldInvoice(ctx.from, ctx.body)) return gotoFlow(invoiceFlow)
         if (isOwner(ctx.from) && reportCommand(ctx.body)) {
             await sendDailyReport(provider, reportCommand(ctx.body), [ctx.from])
@@ -1424,7 +1605,7 @@ const orderPromptFlow = addKeyword(EVENTS.ACTION)
         { capture: true },
         async (ctx, { provider, flowDynamic, gotoFlow }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
-            if (isGreeting(ctx.body)) { userCarts.delete(ctx.from); userLists.delete(ctx.from); return gotoFlow(welcomeFlow) }
+            if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
         if (shouldInvoice(ctx.from, ctx.body)) return gotoFlow(invoiceFlow)
 
             await simulateTyping(ctx, provider, 2000)
@@ -1442,16 +1623,16 @@ const categorySelectionFlow = addKeyword(EVENTS.ACTION)
         async (ctx, { gotoFlow, provider, flowDynamic }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
             const input = ctx.body.trim().toLowerCase()
-            if (isGreeting(input)) { userCarts.delete(ctx.from); userLists.delete(ctx.from); return gotoFlow(welcomeFlow) }
+            if (isGreeting(input)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
 
             await simulateTyping(ctx, provider, 1500)
 
-            const liveInventory = await getLiveInventoryFromDb()
+            const liveInventory = await getLiveInventoryFromDb(ctx.from)
 
             if (input === '1' || input.includes('grocery') || input.includes('groceries')) {
                 const groceries = liveInventory.filter(item => item.category.toLowerCase() === 'groceries')
                 const itemsList = groceries
-                    .map((item, index) => `${index + 1}. *${item.item_name}* — ${item.price} (Stock: ${item.stock_quantity})`)
+                    .map((item, index) => `${index + 1}. *${item.item_name}* — ${item.price} (${stockLabel(item.stock_quantity)})`)
                     .join('\n')
 
                 setActiveList(ctx.from, groceries)
@@ -1461,7 +1642,7 @@ const categorySelectionFlow = addKeyword(EVENTS.ACTION)
             } else if (input === '2' || input.includes('electronic')) {
                 const electronics = liveInventory.filter(item => item.category.toLowerCase() === 'electronics')
                 const itemsList = electronics
-                    .map((item, index) => `${index + 1}. *${item.item_name}* — ${item.price} (Stock: ${item.stock_quantity})`)
+                    .map((item, index) => `${index + 1}. *${item.item_name}* — ${item.price} (${stockLabel(item.stock_quantity)})`)
                     .join('\n')
 
                 setActiveList(ctx.from, electronics)
@@ -1493,7 +1674,7 @@ const retailFlow = addKeyword(EVENTS.ACTION)
         async (ctx, { gotoFlow, provider, flowDynamic }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
             const selection = ctx.body.trim().toLowerCase()
-            if (isGreeting(selection)) { userCarts.delete(ctx.from); userLists.delete(ctx.from); return gotoFlow(welcomeFlow) }
+            if (isGreeting(selection)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
 
             if (selection === '1' || selection.includes('web') || selection.includes('site')) {
                 await simulateTyping(ctx, provider, 1500)
@@ -1520,7 +1701,7 @@ const wholesaleFlow = addKeyword(EVENTS.ACTION)
         { capture: true },
         async (ctx, { gotoFlow, provider, flowDynamic }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
-            if (isGreeting(ctx.body)) { userCarts.delete(ctx.from); userLists.delete(ctx.from); return gotoFlow(welcomeFlow) }
+            if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
 
             await simulateTyping(ctx, provider, 2000)
             await logCustomerOrderToPg(ctx.from, `WHOLESALE INQUIRY: ${ctx.body}`)
@@ -1541,7 +1722,7 @@ const supportFlow = addKeyword(EVENTS.ACTION)
         { capture: true },
         async (ctx, { gotoFlow, provider, flowDynamic }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
-            if (isGreeting(ctx.body)) { userCarts.delete(ctx.from); userLists.delete(ctx.from); return gotoFlow(welcomeFlow) }
+            if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
 
             await simulateTyping(ctx, provider, 2000)
             const aiResponse = await getGroqCompletion(ctx.from, ctx.body)
@@ -1580,7 +1761,7 @@ const deliveryDetailsFlow = addKeyword(EVENTS.ACTION)
         { capture: true },
         async (ctx, { gotoFlow }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
-            if (isGreeting(ctx.body)) { userCarts.delete(ctx.from); userLists.delete(ctx.from); return gotoFlow(welcomeFlow) }
+            if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
             const cart = getCart(ctx.from)
             if (cart) cart.location = ctx.body.trim()
             return gotoFlow(invoiceFlow)
@@ -1630,7 +1811,7 @@ const welcomeFlow = addKeyword(EVENTS.ACTION)
 const globalFallbackFlow = addKeyword(EVENTS.WELCOME)
     .addAction(async (ctx, { provider, flowDynamic, gotoFlow }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
-        if (isGreeting(ctx.body)) { userCarts.delete(ctx.from); userLists.delete(ctx.from); return gotoFlow(welcomeFlow) }
+        if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
         if (shouldInvoice(ctx.from, ctx.body)) return gotoFlow(invoiceFlow)
         if (isOwner(ctx.from) && reportCommand(ctx.body)) {
             await sendDailyReport(provider, reportCommand(ctx.body), [ctx.from])
