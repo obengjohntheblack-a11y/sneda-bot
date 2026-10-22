@@ -173,6 +173,8 @@ async function logCustomerOrderToPg(userId, orderDetails) {
 const SESSION_DIR = path.resolve('bot_sessions')
 const syncedFiles = new Map() // file name -> content already saved in Supabase
 let sessionSyncRunning = false
+let sessionResetting = false
+let restoredFromDb = false
 
 async function restoreSessionFromDb() {
     try {
@@ -186,6 +188,7 @@ async function restoreSessionFromDb() {
             fs.writeFileSync(path.join(SESSION_DIR, path.basename(row.file_name)), row.content, 'utf8')
             syncedFiles.set(path.basename(row.file_name), row.content)
         }
+        restoredFromDb = true
         console.log(`✅ Restored WhatsApp session (${res.rows.length} files) from Supabase`)
     } catch (err) {
         console.error('❌ Could not restore WhatsApp session:', err.message)
@@ -193,7 +196,7 @@ async function restoreSessionFromDb() {
 }
 
 async function backupSessionToDb() {
-    if (sessionSyncRunning || !fs.existsSync(SESSION_DIR)) return
+    if (sessionSyncRunning || sessionResetting || !fs.existsSync(SESSION_DIR)) return
     sessionSyncRunning = true
     try {
         const files = fs.readdirSync(SESSION_DIR).filter((f) => f.endsWith('.json'))
@@ -225,6 +228,50 @@ async function backupSessionToDb() {
         console.error('❌ WhatsApp session backup failed:', err.message)
     } finally {
         sessionSyncRunning = false
+    }
+}
+
+// If WhatsApp logs this device out (for example you removed it under "Linked devices"), the saved login
+// in Supabase is useless. Clear it and restart, so the bot starts clean and shows a fresh QR code.
+async function resetSavedSession(reason) {
+    if (sessionResetting) return
+    sessionResetting = true
+    console.error(`🔄 The saved WhatsApp login cannot be used (${reason}). Clearing it and restarting for a fresh QR code...`)
+    try {
+        await pool.query('DELETE FROM wa_session_files')
+    } catch (err) {
+        console.error('❌ Could not clear the saved session in Supabase:', err.message)
+    }
+    try {
+        fs.rmSync(SESSION_DIR, { recursive: true, force: true })
+        fs.rmSync(path.resolve('bot.qr.png'), { force: true })
+    } catch {
+        // nothing to remove
+    }
+    syncedFiles.clear()
+    setTimeout(() => process.exit(0), 2000) // the host restarts the service automatically
+}
+
+const SESSION_WATCHDOG_MS = 3 * 60 * 1000
+function startSessionGuard(provider) {
+    let attachedTo = null
+    setInterval(() => {
+        const sock = provider.vendor
+        if (!sock?.ev?.on || sock === attachedTo) return
+        attachedTo = sock // a new connection object appears after every reconnect
+        sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
+            const code = lastDisconnect?.error?.output?.statusCode
+            if (connection === 'close' && code === 401) resetSavedSession('WhatsApp logged this device out (401)')
+        })
+    }, 200)
+
+    // Backup check: a restored login that neither connects nor shows a QR code is stuck, so start clean
+    if (restoredFromDb) {
+        setTimeout(() => {
+            const connected = !!provider.vendor?.user
+            const qrShown = fs.existsSync(path.resolve('bot.qr.png'))
+            if (!connected && !qrShown) resetSavedSession('the restored login did not connect and no QR code appeared')
+        }, SESSION_WATCHDOG_MS)
     }
 }
 
@@ -475,7 +522,7 @@ function expandListReferences(userId, text) {
     // 2) a number reference inside a longer message: "number 3, 5 pieces", "2 of item 4"
     let changed = false
     const replaced = text.replace(
-        /\b(?:items?|numbers?|nos?\.?|options?)\s*#?\s*(\d{1,3}(?:\s*(?:,|and|&)\s*\d{1,3})*)|#\s*(\d{1,3})\b/gi,
+        /\b(?:items?|numbers?|nos?\.?|options?)\s*#?\s*(\d{1,3}(?:\s*(?:and|&)\s*\d{1,3})*)|#\s*(\d{1,3})\b/gi,
         (full, many, one) => {
             const nums = numbersIn(many || one)
             const names = nums.map(nameOf)
@@ -1672,7 +1719,8 @@ const main = async () => {
     }
 
     // ---- QR page: link WhatsApp from any browser (no need to read the Render logs) ----
-    const QR_KEY = process.env.QR_KEY || crypto.randomBytes(6).toString('hex')
+    // The key is the same after every restart (derived from your database password). You can also set QR_KEY in Render.
+    const QR_KEY = process.env.QR_KEY || crypto.createHash('sha256').update(String(dbConfig.password) + '|qr').digest('hex').slice(0, 12)
     const qrAllowed = (req) => new URL(req.url, 'http://x').searchParams.get('key') === QR_KEY
     const sendHtml = (res, status, html) => {
         res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
@@ -1689,12 +1737,15 @@ const main = async () => {
             return sendHtml(res, 200, qrPage('<h2>✅ WhatsApp is connected</h2><p>No QR code needed.</p>'))
         }
         if (!fs.existsSync(path.resolve('bot.qr.png'))) {
-            return sendHtml(res, 200, qrPage('<h2>⏳ Waiting for a QR code…</h2><p>This page refreshes by itself.</p>', 5))
+            return sendHtml(res, 200, qrPage(
+                '<h2>⏳ Waiting for a QR code…</h2><p>This page refreshes by itself.</p>' +
+                `<p style="margin-top:32px;font-size:14px">Still here after 2 minutes? The saved WhatsApp login may be out of date. <a href="/reset?key=${QR_KEY}">Reset the saved login</a> (the bot restarts and shows a fresh QR code).</p>`, 5))
         }
         sendHtml(res, 200, qrPage(
             `<h2>Scan with WhatsApp</h2><p>Settings → Linked devices → Link a device</p>` +
             `<img src="/qr.png?key=${QR_KEY}&t=${Date.now()}" style="width:min(320px,90vw)">` +
-            `<p>The code changes every ~20 seconds, so this page refreshes automatically.</p>`, 10))
+            `<p>The code changes every ~20 seconds, so this page refreshes automatically.</p>` +
+            `<p style="margin-top:32px;font-size:14px">Scan keeps failing? <a href="/reset?key=${QR_KEY}">Reset the saved login</a>.</p>`, 10))
     })
 
     adapterProvider.server.get('/qr.png', (req, res) => {
@@ -1705,6 +1756,14 @@ const main = async () => {
         }
         res.writeHead(200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' })
         res.end(fs.readFileSync(file))
+    })
+
+    adapterProvider.server.get('/reset', (req, res) => {
+        if (!qrAllowed(req)) return sendHtml(res, 403, 'Forbidden')
+        sendHtml(res, 200, qrPage(
+            '<h2>🔄 Resetting…</h2><p>The saved WhatsApp login is being cleared and the bot is restarting.</p>' +
+            `<p>Wait about a minute, then <a href="/qr?key=${QR_KEY}">open the QR page</a>.</p>`))
+        resetSavedSession('manual reset from the QR page')
     })
 
     // Save the WhatsApp login to Supabase every 15 seconds (only changed files are uploaded)
@@ -1727,6 +1786,9 @@ const main = async () => {
     } else {
         console.log('⏰ Keep-alive off (no RENDER_EXTERNAL_URL or PUBLIC_URL found)')
     }
+
+    // ---- Session guard: if WhatsApp logs the bot out, clear the saved login and restart for a fresh QR code ----
+    startSessionGuard(adapterProvider)
 
     // ---- Human takeover: pause the bot while a person is chatting with a customer ----
     if (HUMAN_TAKEOVER) startHumanTakeoverWatcher(adapterProvider)
