@@ -317,7 +317,7 @@ const DIGITAL_CATALOG_URL = 'https://www.snedashopping.com/'
 // Shop details printed on invoices (edit these)
 const STORE_NAME = 'SNEDA Shopping Center'
 const STORE_ADDRESS = 'Accra, Ghana'
-const STORE_PHONE = '' // optional, e.g. '+233 24 000 0000'
+const STORE_PHONE = '0543812261' // optional, e.g. '+233 24 000 0000'
 const OWNER_NUMBER = '0543812261' // optional: WhatsApp number that gets a copy of every invoice, e.g. '233241234567'
 const REPORT_TIME = '21:30' // daily sales report time, Accra time (24-hour HH:MM)
 const REPORT_FORMATS = ['xlsx', 'pdf'] // choose any of: 'xlsx' (Excel), 'pdf'
@@ -325,7 +325,7 @@ const HUMAN_TAKEOVER = true // pause the bot in a chat when a person replies fro
 const HUMAN_PAUSE_MINUTES = 30 // the bot stays quiet until the person has been silent this long
 const HOLD_MINUTES = 30 // items are reserved for a customer this long while they pay
 const LOW_STOCK_ALERT = 5 // customers see "Only N left", and the owner is warned, at this level or below
-const PAYMENT_DETAILS = '233257575551' // e.g. 'MTN MoMo: 024 000 0000 (SNEDA Shopping Center)'
+const PAYMENT_DETAILS = '0257575551' // e.g. 'MTN MoMo: 024 000 0000 (SNEDA Shopping Center)'
 
 // Owner numbers (OWNER_NUMBER can hold several, separated by commas) receive order alerts and daily reports
 const OWNER_NUMBERS = OWNER_NUMBER.split(',').map((n) => n.replace(/\D/g, '')).filter(Boolean)
@@ -376,6 +376,25 @@ const isBareChoice = (m) => /^\s*(?:option|number|no\.?|choice|#)?\s*\d{1,2}\s*[
 const isPaymentOnly = (m) =>
     /(momo|mobile money|cash|visa|master ?card|telecel|\bat money\b|\bpay\b|payment)/i.test(m) && !/\d/.test(m)
 
+// Numbers that belong to an item name ("5kg", "Box of 40"), sizes ("400g") or phone numbers are NOT quantities
+function quantityText(message, inventory) {
+    let t = String(message)
+    const names = inventory.map((i) => i.item_name).sort((a, b) => b.length - a.length)
+    for (const n of names) t = t.replace(new RegExp(n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'), ' ')
+    return t
+        .replace(/\[[^\]]*\]/g, ' ') // our own "[picked by list number...]" note
+        .replace(/\+?\d[\d\s-]{6,}\d/g, ' ') // phone numbers
+        .replace(/\b\d+(?:\.\d+)?\s?(?:kg|g|ml|cl|l|litres?|liters?|lb|oz)\b/gi, ' ') // sizes like 5kg, 400g, 1L
+}
+const hasQuantity = (t) => /\d/.test(t) || NUMBER_WORDS.test(t)
+
+// Does this message look like a delivery location (and not a question, a payment word or a command)?
+const looksLikeAddress = (m) => {
+    const t = String(m).trim()
+    return t.length >= 3 && t.length <= 150 && !/\?/.test(t) && !isBareChoice(t) && !isPaymentOnly(t) &&
+        !looksPaid(t) && !looksCancel(t) && !wantsInvoiceCopy(t)
+}
+
 const detectPayment = (m) => {
     if (/(momo|mobile money|telecel|\bat money\b)/i.test(m)) return 'Mobile Money'
     if (/(cash|on delivery)/i.test(m)) return 'Cash on Delivery'
@@ -410,10 +429,32 @@ async function calculateOrder(userId, history, userMessage, inventory) {
     if (!groq || inventory.length === 0) return null
 
     const saved = getCart(userId)
-    let items = saved ? saved.items : []
+    let items = saved ? saved.items.map((i) => ({ ...i })) : []
+    let awaiting = saved?.awaiting ?? null // 'quantity' = we asked "how many?", 'location' = we asked for the delivery place
+    let pending = saved?.pending ?? null // names of items whose quantity we are waiting for
+    let location = saved?.location || null
 
-    // Menu choices ("1") and payment answers ("mobile money") never change the order
-    const skipAI = saved && (isBareChoice(userMessage) || isPaymentOnly(userMessage))
+    const messageHasNumber = hasQuantity(quantityText(userMessage, inventory))
+
+    // 1) We asked "how many?" and the customer answered with just a number: set it directly, no AI involved
+    const plainQty = /^\s*(\d{1,4})\s*(?:pcs?|pieces?|units?|bags?|boxes|box|packs?|cartons?|tins?|bottles?|sachets?|please|pls|plz)?\s*[.!]*\s*$/i.exec(userMessage)
+    let handled = false
+    if (saved && awaiting === 'quantity' && plainQty && Number(plainQty[1]) >= 1) {
+        const target = pending && pending.length === 1 ? items.find((i) => i.item_name === pending[0]) : items.length === 1 ? items[0] : null
+        if (target) {
+            target.quantity = Number(plainQty[1])
+            awaiting = null
+            pending = null
+            handled = true
+        }
+    }
+
+    // 2) Menu choices ("1"), payment answers and a delivery location never change the order
+    const changeWords = /\b(make it|change|instead|add|more|less|extra|another)\b/i
+    const skipAI =
+        handled ||
+        (saved && awaiting !== 'quantity' &&
+            (isBareChoice(userMessage) || isPaymentOnly(userMessage) || (awaiting === 'location' && !changeWords.test(userMessage))))
 
     if (!skipAI) {
         try {
@@ -431,16 +472,18 @@ async function calculateOrder(userId, history, userMessage, inventory) {
                         role: 'system',
                         content:
                             'You extract shopping orders. Reply with JSON only, in this shape: ' +
-                            '{"items":[{"item_name":"<exact name from the list>","quantity":<whole number>}]}. ' +
+                            '{"items":[{"item_name":"<exact name from the list>","quantity":<whole number>}],"delivery_location":"<place or null>"}. ' +
                             'Use ONLY names from this list: ' + JSON.stringify(names) + '. ' +
                             'Return the FULL current order. ' +
                             'Previous order (keep it exactly as it is unless the latest message clearly changes it): ' +
                             JSON.stringify(items) + '. ' +
                             'Only change a quantity when the customer clearly says how many units of an item they want ' +
                             '(for example "make it 5", "10 boxes of Indomie", "add 2 Milo"). ' +
-                            'Menu choices like "1" or "2", phone numbers, addresses, house numbers and payment answers are NOT quantities. ' +
+                            'Numbers inside item names or sizes (5kg, 400g, 1L, box of 40), menu choices like "1" or "2", phone numbers, addresses, house numbers and payment answers are NOT quantities. ' +
+                            'If the customer has not said how many, use quantity 1. ' +
+                            'delivery_location is the place the customer wants the order delivered to (an area, address or landmark), only if they clearly said it, otherwise null. ' +
                             'If the customer clearly starts a different order, return only the new items. ' +
-                            'If nothing has been chosen yet, reply {"items":[]}. Never calculate prices.'
+                            'If nothing has been chosen yet, reply {"items":[],"delivery_location":null}. Never calculate prices.'
                     },
                     { role: 'user', content: `Conversation so far:\n${recent}\n\nLatest customer message: ${userMessage}` }
                 ]
@@ -449,6 +492,10 @@ async function calculateOrder(userId, history, userMessage, inventory) {
             const text = (res.choices[0]?.message?.content || '').replace(/```json|```/g, '').trim()
             const parsed = JSON.parse(text || '{}')
             const found = Array.isArray(parsed.items) ? parsed.items : []
+
+            const said = typeof parsed.delivery_location === 'string' ? parsed.delivery_location.trim() : ''
+            if (said && said.toLowerCase() !== 'null' && !location) location = said.slice(0, 150)
+
             if (found.length === 0 && saved && /\b(remove|delete|take\s+out|drop|no\s+more)\b/i.test(userMessage)) items = [] // customer removed everything
 
             const clean = []
@@ -460,14 +507,20 @@ async function calculateOrder(userId, history, userMessage, inventory) {
             }
 
             if (clean.length) {
-                // A saved quantity can only change if the customer actually typed a number
-                // (phone numbers are ignored for this check)
-                const withoutPhones = userMessage.replace(/\+?\d[\d\s-]{6,}\d/g, '')
-                const messageHasNumber = /\d/.test(withoutPhones) || NUMBER_WORDS.test(withoutPhones)
+                const prev = saved?.items || []
+                const newOnes = clean.filter((c) => !prev.some((o) => o.item_name === c.item_name))
+                // A saved quantity only changes if the customer really typed a quantity
                 items = clean.map((c) => {
-                    const old = (saved?.items || []).find((o) => o.item_name === c.item_name)
+                    const old = prev.find((o) => o.item_name === c.item_name)
                     return old && old.quantity !== c.quantity && !messageHasNumber ? old : c
                 })
+                if (newOnes.length && !messageHasNumber) {
+                    awaiting = 'quantity' // an item was chosen but nobody said how many
+                    pending = newOnes.map((c) => c.item_name)
+                } else if (awaiting === 'quantity' && messageHasNumber) {
+                    awaiting = null
+                    pending = null
+                }
             }
         } catch (err) {
             console.warn('⚠️ Order reading skipped:', err?.message)
@@ -478,7 +531,14 @@ async function calculateOrder(userId, history, userMessage, inventory) {
         if (saved) resetCustomer(userId)
         return null
     }
-    userCarts.set(userId, { ...(saved || {}), items, at: Date.now() })
+    userCarts.set(userId, {
+        ...(saved || {}),
+        items,
+        awaiting,
+        pending: awaiting === 'quantity' ? pending : null,
+        location: location || undefined,
+        at: Date.now()
+    })
     return priceItems(items, inventory)
 }
 
@@ -496,6 +556,28 @@ ${lines.join('\n')}
 TOTAL FOR ITEMS: ${money(calc.total)}
 (Delivery fee is not included unless the store information above states one.)
 `
+}
+
+// Decides the next step of the conversation: quantity -> payment method -> delivery location -> summary and payment
+function nextStep(cart, calc) {
+    if (!cart || !calc) return { kind: null, text: '' }
+    if (cart.awaiting === 'quantity') {
+        const names = (cart.pending && cart.pending.length ? cart.pending : cart.items.map((i) => i.item_name)).join(' and ')
+        return { kind: 'quantity', text: `\nNEXT STEP: The customer has not said how many units they want. Ask how many ${names} they need, and nothing else.\n` }
+    }
+    if (calc.lines.some((l) => !l.enough)) {
+        return { kind: 'stock', text: '\nNEXT STEP: Sort out the availability problem described above before anything else.\n' }
+    }
+    if (!cart.payment) {
+        return { kind: 'payment', text: '\nNEXT STEP: The quantity is settled. Show the order total and ask how they want to pay (list only the payment options from the store information).\n' }
+    }
+    if (!cart.location) {
+        return { kind: 'location', text: '\nNEXT STEP: Ask for the delivery location in Accra (an area and landmark, or a WhatsApp location pin).\n' }
+    }
+    return {
+        kind: 'summary',
+        text: '\nNEXT STEP: Everything is known. Show the final order summary (items, total, payment method, delivery location). For Mobile Money or Card, give the payment details and ask them to reply *PAID* after paying. For Cash on Delivery, ask them to reply *CONFIRM ORDER*.\n'
+    }
 }
 
 // =============================================================
@@ -722,6 +804,7 @@ async function getGroqCompletion(userId, userMessage) {
         await saveChatMessageToPg(userId, 'user', userMessage)
 
         let orderBlock = ''
+        let pricedOrder = null
         if (getCart(userId) || looksLikeOrder(userMessage, history)) {
             const calc = await calculateOrder(userId, history, userMessage, liveInventory)
             if (calc) {
@@ -731,9 +814,24 @@ async function getGroqCompletion(userId, userMessage) {
                     if (reserved) applyReservation(calc, reserved)
                 }
                 orderBlock = formatOrderBlock(calc)
+                pricedOrder = calc
             }
         }
+
+        // We asked for a delivery location and the customer answered with a place
+        const cartNow = getCart(userId)
+        if (cartNow && cartNow.awaiting === 'location' && !cartNow.location && looksLikeAddress(userMessage)) {
+            cartNow.location = userMessage.trim().slice(0, 150)
+            cartNow.awaiting = null
+        }
         noteCartDetails(userId, userMessage)
+
+        // Tell the AI exactly what to do next, so the conversation keeps the right order
+        if (cartNow && pricedOrder) {
+            const step = nextStep(cartNow, pricedOrder)
+            cartNow.awaiting = step.kind === 'quantity' ? 'quantity' : step.kind === 'location' ? 'location' : null
+            orderBlock += step.text
+        }
 
         const dynamicSystemPrompt = `
 You are SNEDA Shopping Center's friendly, sharp, and accurate sales assistant located in Accra, Ghana.
@@ -761,6 +859,7 @@ STRICT INSTRUCTIONS:
 10. Do not number your own product lists (use bullets), because customers may reply with a number from the store's numbered menu.
 11. Never promise more than the stock level shown. Items are reserved for a customer for ${HOLD_MINUTES} minutes while they pay. If an item is out of stock or only some units are available, say so clearly, offer the available quantity or an alternative, and never ask the customer to pay for items that are not available.
 12. If a customer wants to change an order, confirm the change. If they want to cancel an order that already has an invoice, tell them a team member will help them.
+13. Follow the NEXT STEP in the order section exactly, one step at a time. Do not skip ahead, and do not suggest other products while the customer is in the middle of an order.
 `
 
         const chatCompletion = await groq.chat.completions.create({
@@ -818,9 +917,14 @@ const looksPaid = (m) =>
     /\b(paid|payment\s+(?:is\s+|has\s+been\s+)?(?:made|done|sent|complete[d]?)|(?:i|we)(?:\s+have|'ve|’ve)?\s+(?:already\s+)?(?:sent|transferred|made)\s+(?:the\s+)?(?:money|payment)|money\s+(?:sent|transferred)|sent\s+the\s+money)\b/i.test(m)
 const looksConfirmed = (m) => /\b(confirm(?:ed)?(?:\s+my)?(?:\s+the)?\s+order|place\s+(?:my\s+|the\s+)?order|go\s+ahead|proceed)\b/i.test(m)
 
+const wantsInvoiceCopy = (m) => /\b(invoice|receipt)\b/i.test(m)
+const looksCancel = (m) =>
+    /\b(cancel(?:l?ed|l?ing)?|never\s*mind|forget\s+(?:it|about\s+it|the\s+order)|(?:i\s+)?(?:don'?t|do\s+not)\s+want\s+(?:it|this|the\s+order)(?:\s+any\s?more)?|stop\s+the\s+order)\b/i.test(m)
+
 const shouldInvoice = (userId, msg) => {
+    if (NOT_YET.test(msg)) return false
     const cart = getCart(userId)
-    if (!cart || NOT_YET.test(msg)) return false
+    if (!cart) return looksPaid(msg) || wantsInvoiceCopy(msg) // no open order: maybe re-send an existing invoice
     if (looksPaid(msg)) return true
     return cart.payment === 'Cash on Delivery' && looksConfirmed(msg)
 }
@@ -865,7 +969,7 @@ async function getDeliveryDetails(userId) {
 
 function buildInvoiceText(inv) {
     const items = inv.lines
-        .map((l) => `${l.qty} × ${l.item}\n      @ ${money(l.unit)} = ${money(l.subtotal)}`)
+        .map((l) => `${l.qty} × ${l.item}\n      @ ${money(l.unit)} = ${money(l.subtotal)}` + (l.requested && l.requested > l.qty ? `\n      ⚠️ You asked for ${l.requested}, ${l.qty} supplied` : ''))
         .join('\n')
     return [
         `🧾 *INVOICE ${inv.invoiceNo}*`,
@@ -966,77 +1070,173 @@ async function buildInvoicePdf(inv) {
     })
 }
 
-// Saves the invoice, sends it to the customer (text + PDF) and copies the owner.
-async function issueInvoice(ctx, provider, flowDynamic) {
-    const cart = getCart(ctx.from)
-    if (!cart) return false
+// Tells every owner number something (new order, low stock, problems...)
+async function notifyOwners(provider, text) {
+    for (const n of OWNER_NUMBERS) {
+        try {
+            await provider.sendMessage(n, text, {})
+        } catch (err) {
+            console.warn('⚠️ Could not notify the owner:', err?.message)
+        }
+    }
+}
 
-    const inventory = await getLiveInventoryFromDb()
-    const priced = priceItems(cart.items, inventory)
-    if (!priced) return false
-
-    const payMethod = cart.payment || 'Not specified'
-    const isCash = payMethod === 'Cash on Delivery'
-    const paymentStatus = isCash
-        ? 'Pay cash on delivery'
-        : 'Payment confirmed by customer, being verified by our team'
-
-    const now = new Date()
-    const stamp = now.toLocaleDateString('en-CA', { timeZone: 'Africa/Accra' }).replace(/-/g, '')
-    let invoiceNo = `INV-${stamp}-${Math.floor(1000 + Math.random() * 9000)}`
-
+// Takes the items out of stock and saves the invoice. Everything succeeds together or nothing happens.
+// Items are locked while this runs, so two customers can never both get the last units.
+async function commitSale(userId, cart, { payMethod, paymentStatus, stamp }) {
+    const client = await pool.connect()
     try {
-        const res = await pool.query(
+        await client.query('BEGIN')
+        const now = Date.now()
+        const items = [...cart.items].sort((a, b) => a.item_name.localeCompare(b.item_name)) // same lock order for everyone
+        const lines = []
+        const lowStock = []
+        let total = 0
+
+        for (const it of items) {
+            const inv = await client.query('SELECT id, item_name, price, stock_quantity FROM inventory WHERE lower(item_name) = lower($1) FOR UPDATE', [it.item_name])
+            if (!inv.rows.length) continue
+            const row = inv.rows[0]
+            const unit = parsePrice(row.price)
+            if (unit === null) continue
+            const others = await client.query(
+                'SELECT COALESCE(SUM(quantity), 0)::int AS held FROM stock_holds WHERE lower(item_name) = lower($1) AND user_id <> $2 AND expires_at > $3',
+                [row.item_name, userId, now]
+            )
+            const available = Math.max(row.stock_quantity - others.rows[0].held, 0)
+            const qty = Math.min(it.quantity, available)
+            if (qty < 1) continue // nothing left of this item
+            const upd = await client.query('UPDATE inventory SET stock_quantity = stock_quantity - $1, updated_at = NOW() WHERE id = $2 RETURNING stock_quantity', [qty, row.id])
+            const left = upd.rows[0].stock_quantity
+            const subtotal = round2(unit * qty)
+            total = round2(total + subtotal)
+            lines.push({ item: row.item_name, qty, requested: it.quantity, unit, subtotal, stock: left, enough: true })
+            if (left <= LOW_STOCK_ALERT) lowStock.push({ item: row.item_name, left })
+        }
+
+        if (!lines.length) {
+            await client.query('ROLLBACK')
+            return null
+        }
+
+        const ins = await client.query(
             `INSERT INTO invoices (user_id, customer_name, customer_phone, delivery_location, items, total, payment_method, payment_status)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
-            [ctx.from, cart.customerName || null, ctx.from, cart.location, JSON.stringify(priced.lines), priced.total, payMethod, paymentStatus]
+            [userId, cart.customerName || null, userId, cart.location, JSON.stringify(lines), total, payMethod, paymentStatus]
         )
-        invoiceNo = `INV-${stamp}-${String(res.rows[0].id).padStart(4, '0')}`
-        await pool.query('UPDATE invoices SET invoice_no = $1 WHERE id = $2', [invoiceNo, res.rows[0].id])
+        const invoiceNo = `INV-${stamp}-${String(ins.rows[0].id).padStart(4, '0')}`
+        await client.query('UPDATE invoices SET invoice_no = $1 WHERE id = $2', [invoiceNo, ins.rows[0].id])
+        await client.query('DELETE FROM stock_holds WHERE user_id = $1', [userId])
+        await client.query('DELETE FROM customer_carts WHERE user_id = $1', [userId])
+        await client.query('COMMIT')
+
+        const partial = lines.length < items.length || lines.some((l) => l.qty < l.requested)
+        return { invoiceNo, lines, total, lowStock, partial }
     } catch (err) {
-        console.error('❌ Error saving invoice to PG:', err.message)
+        await client.query('ROLLBACK').catch(() => {})
+        console.error('❌ Could not complete the sale:', err.message)
+        return null
+    } finally {
+        client.release()
     }
+}
 
-    const inv = {
-        invoiceNo,
-        dateText: accraTime(now),
-        phone: String(ctx.from).replace(/\D/g, ''),
-        name: cart.customerName || null,
-        location: cart.location,
-        lines: priced.lines,
-        total: priced.total,
-        payMethod,
-        isCash,
-        paymentStatus
-    }
-
+// Sends the invoice to the customer (text + PDF)
+async function sendInvoiceMessages(inv, flowDynamic) {
     await flowDynamic(buildInvoiceText(inv))
-
     try {
         const file = await buildInvoicePdf(inv)
         if (file) await flowDynamic([{ body: '📄 Your invoice (PDF)', media: file }])
     } catch (err) {
         console.error('❌ Invoice PDF failed:', err.message)
     }
+}
 
-    if (OWNER_NUMBER) {
-        try {
-            const short = priced.lines.some((l) => !l.enough) ? '\n⚠️ Some items exceed stock. Please check.' : ''
-            for (const ownerNo of OWNER_NUMBERS) await provider.sendMessage(
-                ownerNo,
-                `🔔 *New order ${invoiceNo}*\n${inv.lines.map((l) => `${l.qty} × ${l.item}`).join('\n')}\n*Total:* ${money(inv.total)}\n*Payment:* ${payMethod} (${paymentStatus})\n*Customer:* +${inv.phone}\n*Delivery:* ${inv.location}${short}`,
-                {}
-            )
-        } catch (err) {
-            console.warn('⚠️ Could not notify owner:', err?.message)
-        }
+// TODO (when we migrate to Meta Cloud API): send the invoice PDF from a public URL (Meta cannot send local files), and add buttons.
+async function issueInvoice(ctx, provider, flowDynamic) {
+    const cart = getCart(ctx.from)
+    if (!cart) return false
+
+    const payMethod = cart.payment || 'Not specified'
+    const isCash = payMethod === 'Cash on Delivery'
+    const paymentStatus = isCash ? 'Pay cash on delivery' : 'Payment confirmed by customer, being verified by our team'
+    const now = new Date()
+    const stamp = now.toLocaleDateString('en-CA', { timeZone: 'Africa/Accra' }).replace(/-/g, '')
+    const phone = String(ctx.from).replace(/\D/g, '')
+
+    const sale = await commitSale(ctx.from, cart, { payMethod, paymentStatus, stamp })
+    if (!sale) {
+        const wanted = cart.items.map((i) => `${i.quantity} × ${i.item_name}`).join(', ')
+        await notifyOwners(provider, `⚠️ *Could not create an invoice* for +${phone}.\nOrder: ${wanted}\nDelivery: ${cart.location || 'not given'}\nPlease contact the customer.`)
+        return false
+    }
+    userCarts.delete(ctx.from)
+    persistedCarts.delete(ctx.from)
+
+    const inv = {
+        invoiceNo: sale.invoiceNo,
+        dateText: accraTime(now),
+        phone,
+        name: cart.customerName || null,
+        location: cart.location,
+        lines: sale.lines,
+        total: sale.total,
+        payMethod,
+        isCash,
+        paymentStatus
+    }
+    await sendInvoiceMessages(inv, flowDynamic)
+    if (sale.partial) {
+        await flowDynamic('⚠️ Some items were no longer available in the full quantity. Our team will contact you about the rest.')
     }
 
-    // TODO (when we migrate to Meta Cloud API): reduce stock here after an invoice is issued, e.g.
-    // UPDATE inventory SET stock_quantity = GREATEST(stock_quantity - $1, 0) WHERE lower(item_name) = lower($2)
-    // Also: send the invoice PDF from a public URL (Meta cannot send local files), and add buttons.
-    userCarts.delete(ctx.from)
-    console.log(`🧾 Invoice ${invoiceNo} issued to ${ctx.from}`)
+    const alerts = []
+    if (sale.partial) alerts.push('⚠️ PARTIAL ORDER: not everything the customer asked for was available. Please contact the customer.')
+    for (const l of sale.lowStock) alerts.push(`📉 Low stock: ${l.item} — ${l.left} left`)
+    await notifyOwners(
+        provider,
+        `🔔 *New order ${sale.invoiceNo}*\n${sale.lines.map((l) => `${l.qty} × ${l.item}`).join('\n')}\n*Total:* ${money(sale.total)}\n*Payment:* ${payMethod} (${paymentStatus})\n*Customer:* +${phone}\n*Delivery:* ${cart.location}` +
+            (alerts.length ? '\n\n' + alerts.join('\n') : '')
+    )
+
+    console.log(`🧾 Invoice ${sale.invoiceNo} issued to ${ctx.from}`)
+    return true
+}
+
+// The customer's most recent invoice (last 24 hours), if any
+async function getRecentInvoice(userId) {
+    try {
+        const res = await pool.query(
+            `SELECT invoice_no, customer_name, customer_phone, delivery_location, items, total, payment_method, payment_status, created_at
+             FROM invoices WHERE user_id = $1 AND created_at > NOW() - INTERVAL '24 hours' ORDER BY id DESC LIMIT 1`,
+            [userId]
+        )
+        return res.rows[0] || null
+    } catch (err) {
+        console.error('❌ Could not look up the last invoice:', err.message)
+        return null
+    }
+}
+
+// "Send me my invoice again", or "I paid" after a restart: re-send the invoice that already exists
+async function resendLastInvoice(ctx, provider, flowDynamic) {
+    const r = await getRecentInvoice(ctx.from)
+    if (!r) return false
+    const lines = Array.isArray(r.items) ? r.items : JSON.parse(r.items || '[]')
+    const inv = {
+        invoiceNo: r.invoice_no,
+        dateText: accraTime(new Date(r.created_at)),
+        phone: String(r.customer_phone || ctx.from).replace(/\D/g, ''),
+        name: r.customer_name,
+        location: r.delivery_location,
+        lines,
+        total: Number(r.total),
+        payMethod: r.payment_method,
+        isCash: r.payment_method === 'Cash on Delivery',
+        paymentStatus: r.payment_status
+    }
+    await flowDynamic('Here is your invoice again 🧾')
+    await sendInvoiceMessages(inv, flowDynamic)
     return true
 }
 
@@ -1573,12 +1773,74 @@ async function handleOwnerCommand(text) {
 }
 
 // =============================================================
+// 📎 PHOTOS, VOICE NOTES, LOCATION PINS — messages that are not text
+// =============================================================
+const nonTextKind = (ctx) => {
+    const b = String(ctx.body || '')
+    if (!b.startsWith('_event_')) return null
+    if (b.includes('location')) return 'location'
+    if (b.includes('voice')) return 'voice'
+    if (b.includes('document')) return 'document'
+    if (b.includes('media')) return 'media'
+    return 'other'
+}
+
+// A WhatsApp location pin as readable text with a map link
+function locationFromCtx(ctx) {
+    if (nonTextKind(ctx) !== 'location') return null
+    const m = ctx.message || {}
+    const loc = m.locationMessage || m.liveLocationMessage || m.ephemeralMessage?.message?.locationMessage
+    const lat = loc?.degreesLatitude ?? ctx.degreesLatitude
+    const lng = loc?.degreesLongitude ?? ctx.degreesLongitude
+    if (lat == null || lng == null) return 'Location pin shared in WhatsApp'
+    const label = [loc?.name, loc?.address].filter(Boolean).join(', ')
+    return `${label ? label + ' — ' : ''}Pin: https://maps.google.com/?q=${lat},${lng}`
+}
+
+const NON_TEXT_REPLIES = {
+    voice: '🎤 Sorry, I can’t listen to voice notes yet. Please type what you need, for example: _2 Milo Powder_.',
+    media: '📷 Thanks for the photo! I can’t view images yet. Please type the name of the item you want and I’ll check it for you.',
+    document: '📎 Thanks! I can’t open files in this chat. Please type your request and I’ll help.',
+    other: '👍 Thanks! I can only read text messages and location pins here. Please type your request.'
+}
+const lastNonTextAlert = new Map()
+
+async function handleNonText(ctx, { flowDynamic, provider }) {
+    const kind = nonTextKind(ctx)
+
+    if (kind === 'location') {
+        const pin = locationFromCtx(ctx)
+        const cart = getCart(ctx.from)
+        if (cart) {
+            cart.location = pin // used on the invoice
+            if (cart.awaiting === 'location') cart.awaiting = null
+            await flowDynamic(await getGroqCompletion(ctx.from, 'I have shared my delivery location pin.')) // carry on with the next step
+        } else {
+            await flowDynamic('📍 Thank you for sharing your location! What would you like to order? Type the item name and quantity.')
+        }
+        return
+    }
+
+    await flowDynamic(NON_TEXT_REPLIES[kind] || NON_TEXT_REPLIES.other)
+
+    // Tell the owner (at most once every 10 minutes per customer) so a person can look at it
+    const now = Date.now()
+    if (now - (lastNonTextAlert.get(ctx.from) || 0) > 10 * 60 * 1000) {
+        lastNonTextAlert.set(ctx.from, now)
+        const what = { voice: 'a voice note', media: 'a photo or video', document: 'a file' }[kind] || 'a message'
+        await notifyOwners(provider, `🔔 Customer +${String(ctx.from).replace(/\D/g, '')} sent ${what} that the bot cannot read. Please check the chat.`)
+    }
+}
+
+// =============================================================
 // 🛍️ 5. FLOW DEFINITIONS
 // =============================================================
 const orderCaptureFlow = addKeyword(EVENTS.ACTION)
-    .addAction({ capture: true }, async (ctx, { provider, flowDynamic, gotoFlow }) => {
+    .addAction({ capture: true }, async (ctx, { provider, flowDynamic, gotoFlow, flowDynamic: _fd, provider: _pv }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
+        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
         if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
+        if (looksCancel(ctx.body)) return gotoFlow(cancelFlow)
         if (shouldInvoice(ctx.from, ctx.body)) return gotoFlow(invoiceFlow)
         if (isOwner(ctx.from) && reportCommand(ctx.body)) {
             await sendDailyReport(provider, reportCommand(ctx.body), [ctx.from])
@@ -1601,16 +1863,18 @@ const orderCaptureFlow = addKeyword(EVENTS.ACTION)
 
 const orderPromptFlow = addKeyword(EVENTS.ACTION)
     .addAnswer(
-        '🛒 *Great choice!* Please reply with the *item number* or *item name*, the *quantity*, your *delivery location* in Accra, and your *payment method* (e.g., Mobile Money or Cash on Delivery):',
+        '🛒 *Great choice!* Reply with the *item number* or *item name* of what you would like. You can add the quantity too (for example: _5 Milo Powder_).',
         { capture: true },
-        async (ctx, { provider, flowDynamic, gotoFlow }) => {
+        async (ctx, { provider, flowDynamic, gotoFlow, flowDynamic: _fd, provider: _pv }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
+        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
             if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
+        if (looksCancel(ctx.body)) return gotoFlow(cancelFlow)
         if (shouldInvoice(ctx.from, ctx.body)) return gotoFlow(invoiceFlow)
 
             await simulateTyping(ctx, provider, 2000)
             await logCustomerOrderToPg(ctx.from, ctx.body)
-            const aiResponse = await getGroqCompletion(ctx.from, `Customer ordered/inquired: ${ctx.body}`)
+            const aiResponse = await getGroqCompletion(ctx.from, ctx.body)
             await flowDynamic(aiResponse)
             return gotoFlow(orderCaptureFlow)
         }
@@ -1620,8 +1884,9 @@ const categorySelectionFlow = addKeyword(EVENTS.ACTION)
     .addAnswer(
         'Which category would you like to explore?\n\n1️⃣ *Groceries*\n2️⃣ *Electronics*\n3️⃣ *View Official Web Store*',
         { capture: true },
-        async (ctx, { gotoFlow, provider, flowDynamic }) => {
+        async (ctx, { gotoFlow, provider, flowDynamic, flowDynamic: _fd, provider: _pv }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
+        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
             const input = ctx.body.trim().toLowerCase()
             if (isGreeting(input)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
 
@@ -1671,8 +1936,9 @@ const retailFlow = addKeyword(EVENTS.ACTION)
             '2️⃣ *Browse In-Chat Categories*'
         ].join('\n'),
         { capture: true },
-        async (ctx, { gotoFlow, provider, flowDynamic }) => {
+        async (ctx, { gotoFlow, provider, flowDynamic, flowDynamic: _fd, provider: _pv }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
+        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
             const selection = ctx.body.trim().toLowerCase()
             if (isGreeting(selection)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
 
@@ -1699,8 +1965,9 @@ const wholesaleFlow = addKeyword(EVENTS.ACTION)
             '👉 *Please specify your Business Name and the bulk items/quantities you require:*'
         ].join('\n'),
         { capture: true },
-        async (ctx, { gotoFlow, provider, flowDynamic }) => {
+        async (ctx, { gotoFlow, provider, flowDynamic, flowDynamic: _fd, provider: _pv }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
+        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
             if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
 
             await simulateTyping(ctx, provider, 2000)
@@ -1720,8 +1987,9 @@ const supportFlow = addKeyword(EVENTS.ACTION)
             '👉 *Please type your inquiry below:*'
         ].join('\n'),
         { capture: true },
-        async (ctx, { gotoFlow, provider, flowDynamic }) => {
+        async (ctx, { gotoFlow, provider, flowDynamic, flowDynamic: _fd, provider: _pv }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
+        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
             if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
 
             await simulateTyping(ctx, provider, 2000)
@@ -1732,11 +2000,13 @@ const supportFlow = addKeyword(EVENTS.ACTION)
     )
 
 const invoiceFlow = addKeyword(EVENTS.ACTION)
-    .addAction(async (ctx, { provider, flowDynamic, gotoFlow }) => {
+    .addAction(async (ctx, { provider, flowDynamic, gotoFlow, flowDynamic: _fd, provider: _pv }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
+        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
         const cart = getCart(ctx.from)
         if (!cart) {
-            await flowDynamic('I could not find an active order. Type *menu* to start a new one.')
+            const resent = await resendLastInvoice(ctx, provider, flowDynamic)
+            if (!resent) await flowDynamic(await getGroqCompletion(ctx.from, ctx.body))
             return gotoFlow(orderCaptureFlow)
         }
 
@@ -1759,14 +2029,41 @@ const deliveryDetailsFlow = addKeyword(EVENTS.ACTION)
     .addAnswer(
         '📍 Almost done! Please send your *delivery location* in Accra (area and nearest landmark) so we can complete your invoice:',
         { capture: true },
-        async (ctx, { gotoFlow }) => {
+        async (ctx, { gotoFlow, flowDynamic: _fd, provider: _pv }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
+        const pin = locationFromCtx(ctx)
+        if (pin) {
+            const cart = getCart(ctx.from)
+            if (cart) cart.location = pin
+            return gotoFlow(invoiceFlow)
+        }
+        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
             if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
             const cart = getCart(ctx.from)
             if (cart) cart.location = ctx.body.trim()
             return gotoFlow(invoiceFlow)
         }
     )
+
+const cancelFlow = addKeyword(EVENTS.ACTION)
+    .addAction(async (ctx, { provider, flowDynamic, gotoFlow, flowDynamic: _fd, provider: _pv }) => {
+        if (isPaused(ctx)) return notePausedMessage(ctx)
+        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
+        const cart = getCart(ctx.from)
+        if (cart) {
+            resetCustomer(ctx.from) // empties the order and gives the reserved items back
+            await flowDynamic('✅ Your order has been cancelled and nothing has been charged. Type *menu* whenever you want to order again.')
+            return gotoFlow(orderCaptureFlow)
+        }
+        const last = await getRecentInvoice(ctx.from)
+        if (last) {
+            await notifyOwners(provider, `⚠️ *Cancellation request* from +${String(ctx.from).replace(/\D/g, '')} for invoice ${last.invoice_no} (${money(Number(last.total))}). Please contact the customer.`)
+            await flowDynamic(`I have passed your request about invoice *${last.invoice_no}* to our team. They will contact you shortly.`)
+        } else {
+            await flowDynamic(await getGroqCompletion(ctx.from, ctx.body))
+        }
+        return gotoFlow(orderCaptureFlow)
+    })
 
 // =============================================================
 // 🛒 6. WELCOME MENU (reached only through gotoFlow, no keywords)
@@ -1786,8 +2083,9 @@ const welcomeFlow = addKeyword(EVENTS.ACTION)
             '👉 *Reply with 1, 2, or 3 (or ask any question directly!):*'
         ].join('\n'),
         { capture: true },
-        async (ctx, { gotoFlow, provider, flowDynamic }) => {
+        async (ctx, { gotoFlow, provider, flowDynamic, flowDynamic: _fd, provider: _pv }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
+        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
             const userInput = ctx.body.trim().toLowerCase()
 
             if (userInput === '1' || userInput.includes('retail')) {
@@ -1809,9 +2107,11 @@ const welcomeFlow = addKeyword(EVENTS.ACTION)
 
 // Catches every first message from a customer
 const globalFallbackFlow = addKeyword(EVENTS.WELCOME)
-    .addAction(async (ctx, { provider, flowDynamic, gotoFlow }) => {
+    .addAction(async (ctx, { provider, flowDynamic, gotoFlow, flowDynamic: _fd, provider: _pv }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
+        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
         if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
+        if (looksCancel(ctx.body)) return gotoFlow(cancelFlow)
         if (shouldInvoice(ctx.from, ctx.body)) return gotoFlow(invoiceFlow)
         if (isOwner(ctx.from) && reportCommand(ctx.body)) {
             await sendDailyReport(provider, reportCommand(ctx.body), [ctx.from])
@@ -1838,6 +2138,7 @@ const main = async () => {
     await initDbTables()
     await restoreSessionFromDb() // must run before the WhatsApp provider starts
     await loadPauses()
+    await loadCarts() // unfinished orders come back after a restart
 
     const adapterFlow = createFlow([
         globalFallbackFlow,
@@ -1848,6 +2149,7 @@ const main = async () => {
         orderCaptureFlow,
         invoiceFlow,
         deliveryDetailsFlow,
+        cancelFlow,
         wholesaleFlow,
         supportFlow
     ])
@@ -1967,6 +2269,19 @@ const main = async () => {
     } else {
         console.log('⏰ Keep-alive off (no RENDER_EXTERNAL_URL or PUBLIC_URL found)')
     }
+
+    // ---- Save unfinished orders every 5 seconds, and save everything when the host stops the bot ----
+    setInterval(() => persistCarts().catch((err) => console.error('❌ Saving orders failed:', err.message)), 5000)
+    setInterval(() => pool.query('DELETE FROM stock_holds WHERE expires_at < $1', [Date.now() - 86400000]).catch(() => {}), 60 * 60 * 1000)
+    process.on('SIGTERM', async () => {
+        try {
+            await persistCarts()
+            await backupSessionToDb()
+        } catch {
+            // exit anyway
+        }
+        process.exit(0)
+    })
 
     // ---- Session guard: if WhatsApp logs the bot out, clear the saved login and restart for a fresh QR code ----
     startSessionGuard(adapterProvider)
