@@ -332,7 +332,30 @@ async function resetSavedSession(reason) {
     await clearAll()
     await delay(2000)
     await clearAll() // second pass catches anything WhatsApp wrote while shutting down
-    process.exit(0) // the host restarts the service automatically
+    await restartHost()
+}
+
+// Restarts the service so it starts clean with no saved login.
+// Exiting with an ERROR code makes Render treat it as a crash and restart it by itself.
+// Extra reliability (optional): add RENDER_API_KEY in Render (Account Settings -> API Keys). Then the bot also
+// asks Render to restart it directly. RENDER_SERVICE_ID is set by Render automatically.
+async function restartHost() {
+    const key = process.env.RENDER_API_KEY
+    const serviceId = process.env.RENDER_SERVICE_ID
+    if (key && serviceId) {
+        try {
+            const res = await fetch(`https://api.render.com/v1/services/${serviceId}/restart`, {
+                method: 'POST',
+                headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' },
+                signal: AbortSignal.timeout(15000)
+            })
+            console.log(`🔁 Asked Render to restart the service (status ${res.status})`)
+            if (res.ok) await delay(30000) // Render stops this process by itself within seconds
+        } catch (err) {
+            console.warn('⚠️ Render restart request failed:', err?.message)
+        }
+    }
+    process.exit(1)
 }
 
 function startSessionGuard(provider) {
