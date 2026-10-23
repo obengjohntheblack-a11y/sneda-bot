@@ -210,15 +210,32 @@ let sessionSyncRunning = false
 let sessionResetting = false
 let restoredFromDb = false
 
+// A login only counts if WhatsApp has really linked this device (creds.json contains "me").
+// A half-finished login (QR shown but never scanned, or leftovers after a logout) is never saved and never restored.
+function credsAreLinked(jsonText) {
+    try {
+        return !!JSON.parse(jsonText)?.me
+    } catch {
+        return false
+    }
+}
+function sessionIsLinked() {
+    try {
+        return credsAreLinked(fs.readFileSync(path.join(SESSION_DIR, 'creds.json'), 'utf8'))
+    } catch {
+        return false
+    }
+}
+
 async function restoreSessionFromDb() {
     try {
-        // Set FORCE_NEW_QR=true in Render to throw the saved login away on the next start.
-        // This runs BEFORE WhatsApp starts, so nothing can re-save the old login. Remove the variable afterwards.
+        // Optional emergency switch: FORCE_NEW_QR=true in Render wipes the saved login at startup.
+        // You should never need it, because logouts are now handled automatically.
         if (String(process.env.FORCE_NEW_QR).toLowerCase() === 'true') {
             await pool.query('DELETE FROM wa_session_files')
             fs.rmSync(SESSION_DIR, { recursive: true, force: true })
             fs.rmSync(path.resolve('bot.qr.png'), { force: true })
-            console.log('🧹 FORCE_NEW_QR is on: the saved WhatsApp login was cleared. A fresh QR code will appear. Remove FORCE_NEW_QR from Render after you have scanned it, or the login is wiped on every restart.')
+            console.log('🧹 FORCE_NEW_QR is on: the saved WhatsApp login was cleared. Remove FORCE_NEW_QR from Render after scanning, or the login is wiped on every restart.')
             return
         }
 
@@ -227,13 +244,17 @@ async function restoreSessionFromDb() {
             console.log('ℹ️ No saved WhatsApp session in Supabase yet (a QR code will be needed once).')
             return
         }
-        // A saved login without creds.json is incomplete (for example, half of it was re-saved after a manual delete)
-        // and can never connect, so it would also block the QR code. Clear it.
-        if (!res.rows.some((r) => path.basename(r.file_name) === 'creds.json')) {
+
+        // Only restore a complete, linked login. Anything else is leftovers and is cleared automatically.
+        const creds = res.rows.find((r) => path.basename(r.file_name) === 'creds.json')
+        if (!creds || !credsAreLinked(creds.content)) {
             await pool.query('DELETE FROM wa_session_files')
-            console.log('🧹 The saved WhatsApp login was incomplete, so it was cleared. A fresh QR code will appear.')
+            fs.rmSync(SESSION_DIR, { recursive: true, force: true })
+            fs.rmSync(path.resolve('bot.qr.png'), { force: true })
+            console.log('🧹 The saved WhatsApp login was incomplete or not linked, so it was cleared. A fresh QR code will appear.')
             return
         }
+
         fs.mkdirSync(SESSION_DIR, { recursive: true })
         for (const row of res.rows) {
             fs.writeFileSync(path.join(SESSION_DIR, path.basename(row.file_name)), row.content, 'utf8')
@@ -248,11 +269,13 @@ async function restoreSessionFromDb() {
 
 async function backupSessionToDb() {
     if (sessionSyncRunning || sessionResetting || !fs.existsSync(SESSION_DIR)) return
+    if (!sessionIsLinked()) return // never save a login that WhatsApp has not linked (or has just logged out)
     sessionSyncRunning = true
     try {
         const files = fs.readdirSync(SESSION_DIR).filter((f) => f.endsWith('.json'))
 
         for (const file of files) {
+            if (sessionResetting) break
             let content
             try {
                 content = fs.readFileSync(path.join(SESSION_DIR, file), 'utf8')
@@ -270,6 +293,7 @@ async function backupSessionToDb() {
         }
 
         for (const file of [...syncedFiles.keys()]) {
+            if (sessionResetting) break
             if (!files.includes(file)) {
                 await pool.query('DELETE FROM wa_session_files WHERE file_name = $1', [file])
                 syncedFiles.delete(file)
@@ -283,27 +307,34 @@ async function backupSessionToDb() {
 }
 
 // If WhatsApp logs this device out (for example you removed it under "Linked devices"), the saved login
-// in Supabase is useless. Clear it and restart, so the bot starts clean and shows a fresh QR code.
+// is useless. Clear it everywhere and restart, so the bot starts clean and shows a fresh QR code.
 async function resetSavedSession(reason) {
     if (sessionResetting) return
-    sessionResetting = true
+    sessionResetting = true // stops any new backup from starting
     console.error(`🔄 The saved WhatsApp login cannot be used (${reason}). Clearing it and restarting for a fresh QR code...`)
-    try {
-        await pool.query('DELETE FROM wa_session_files')
-    } catch (err) {
-        console.error('❌ Could not clear the saved session in Supabase:', err.message)
+
+    for (let i = 0; i < 40 && sessionSyncRunning; i++) await delay(250) // let a backup that is already running finish first
+
+    const clearAll = async () => {
+        try {
+            await pool.query('DELETE FROM wa_session_files')
+        } catch (err) {
+            console.error('❌ Could not clear the saved session in Supabase:', err.message)
+        }
+        try {
+            fs.rmSync(SESSION_DIR, { recursive: true, force: true })
+            fs.rmSync(path.resolve('bot.qr.png'), { force: true })
+        } catch {
+            // nothing to remove
+        }
+        syncedFiles.clear()
     }
-    try {
-        fs.rmSync(SESSION_DIR, { recursive: true, force: true })
-        fs.rmSync(path.resolve('bot.qr.png'), { force: true })
-    } catch {
-        // nothing to remove
-    }
-    syncedFiles.clear()
-    setTimeout(() => process.exit(0), 2000) // the host restarts the service automatically
+    await clearAll()
+    await delay(2000)
+    await clearAll() // second pass catches anything WhatsApp wrote while shutting down
+    process.exit(0) // the host restarts the service automatically
 }
 
-const SESSION_WATCHDOG_MS = 3 * 60 * 1000
 function startSessionGuard(provider) {
     let attachedTo = null
     let badSessionCount = 0 // how many times in a row WhatsApp rejected the restored login
@@ -319,6 +350,7 @@ function startSessionGuard(provider) {
                 console.error('⚠️ Code 440: this WhatsApp login is open somewhere else (another running copy of the bot?). Make sure only ONE copy is running.')
             }
             if (connection === 'open') badSessionCount = 0
+            // 401 = you removed the device from Linked devices (or WhatsApp logged it out): start over automatically
             if (connection === 'close' && code === 401) resetSavedSession('WhatsApp logged this device out (401)')
             if (connection === 'close' && code === 500 && restoredFromDb && ++badSessionCount >= 3) {
                 resetSavedSession('the saved login looks corrupted (stream error 3 times)')
@@ -326,14 +358,21 @@ function startSessionGuard(provider) {
         })
     }, 200)
 
-    // Backup check: a restored login that neither connects nor shows a QR code is stuck, so start clean
-    if (restoredFromDb) {
-        setTimeout(() => {
-            const connected = !!provider.vendor?.user
-            const qrShown = fs.existsSync(path.resolve('bot.qr.png'))
-            if (!connected && !qrShown) resetSavedSession('the restored login did not connect and no QR code appeared')
-        }, SESSION_WATCHDOG_MS)
-    }
+    // Stuck check: not connected and no QR code to scan. A login that was never linked gets 3 minutes;
+    // a linked login gets 10 minutes (so a short WhatsApp outage never wipes a good login).
+    let stuckSince = null
+    setInterval(() => {
+        if (sessionResetting) return
+        const connected = !!provider.vendor?.user
+        const qrShown = fs.existsSync(path.resolve('bot.qr.png'))
+        if (connected || qrShown) {
+            stuckSince = null
+            return
+        }
+        stuckSince = stuckSince || Date.now()
+        const limit = sessionIsLinked() ? 10 * 60 * 1000 : 3 * 60 * 1000
+        if (Date.now() - stuckSince > limit) resetSavedSession('not connected and no QR code appeared')
+    }, 30 * 1000)
 }
 
 // =============================================================
