@@ -212,9 +212,26 @@ let restoredFromDb = false
 
 async function restoreSessionFromDb() {
     try {
+        // Set FORCE_NEW_QR=true in Render to throw the saved login away on the next start.
+        // This runs BEFORE WhatsApp starts, so nothing can re-save the old login. Remove the variable afterwards.
+        if (String(process.env.FORCE_NEW_QR).toLowerCase() === 'true') {
+            await pool.query('DELETE FROM wa_session_files')
+            fs.rmSync(SESSION_DIR, { recursive: true, force: true })
+            fs.rmSync(path.resolve('bot.qr.png'), { force: true })
+            console.log('🧹 FORCE_NEW_QR is on: the saved WhatsApp login was cleared. A fresh QR code will appear. Remove FORCE_NEW_QR from Render after you have scanned it, or the login is wiped on every restart.')
+            return
+        }
+
         const res = await pool.query('SELECT file_name, content FROM wa_session_files')
         if (!res.rows.length) {
             console.log('ℹ️ No saved WhatsApp session in Supabase yet (a QR code will be needed once).')
+            return
+        }
+        // A saved login without creds.json is incomplete (for example, half of it was re-saved after a manual delete)
+        // and can never connect, so it would also block the QR code. Clear it.
+        if (!res.rows.some((r) => path.basename(r.file_name) === 'creds.json')) {
+            await pool.query('DELETE FROM wa_session_files')
+            console.log('🧹 The saved WhatsApp login was incomplete, so it was cleared. A fresh QR code will appear.')
             return
         }
         fs.mkdirSync(SESSION_DIR, { recursive: true })
@@ -294,7 +311,8 @@ function startSessionGuard(provider) {
         const sock = provider.vendor
         if (!sock?.ev?.on || sock === attachedTo) return
         attachedTo = sock // a new connection object appears after every reconnect
-        sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
+        sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+            if (qr) console.log('📱 WhatsApp generated a QR code. Open the /qr page and scan it.')
             const code = lastDisconnect?.error?.output?.statusCode
             if (connection) console.log(`🔌 WhatsApp connection: ${connection}${code ? ' (code ' + code + ')' : ''}`)
             if (code === 440 && connection === 'close') {
@@ -326,15 +344,15 @@ const DIGITAL_CATALOG_URL = 'https://www.snedashopping.com/'
 // Shop details printed on invoices (edit these)
 const STORE_NAME = 'SNEDA Shopping Center'
 const STORE_ADDRESS = 'Accra, Ghana'
-const STORE_PHONE = '233543812261' // optional, e.g. '+233 24 000 0000'
-const OWNER_NUMBER = '233543812261' // optional: WhatsApp number that gets a copy of every invoice, e.g. '233241234567'
+const STORE_PHONE = '0543812261' // optional, e.g. '+233 24 000 0000'
+const OWNER_NUMBER = '0543812261' // optional: WhatsApp number that gets a copy of every invoice, e.g. '233241234567'
 const REPORT_TIME = '20:30' // daily sales report time, Accra time (24-hour HH:MM)
 const REPORT_FORMATS = ['xlsx', 'pdf'] // choose any of: 'xlsx' (Excel), 'pdf'
 const HUMAN_TAKEOVER = true // pause the bot in a chat when a person replies from the phone
 const HUMAN_PAUSE_MINUTES = 30 // the bot stays quiet until the person has been silent this long
 const HOLD_MINUTES = 30 // items are reserved for a customer this long while they pay
 const LOW_STOCK_ALERT = 5 // customers see "Only N left", and the owner is warned, at this level or below
-const PAYMENT_DETAILS = '233257575551' // e.g. 'MTN MoMo: 024 000 0000 (SNEDA Shopping Center)'
+const PAYMENT_DETAILS = '0257575551' // e.g. 'MTN MoMo: 024 000 0000 (SNEDA Shopping Center)'
 
 // Owner numbers (OWNER_NUMBER can hold several, separated by commas) receive order alerts and daily reports.
 // A Ghana number written as 0543812261 is turned into 233543812261, which is the format WhatsApp needs.
