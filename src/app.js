@@ -289,13 +289,22 @@ async function resetSavedSession(reason) {
 const SESSION_WATCHDOG_MS = 3 * 60 * 1000
 function startSessionGuard(provider) {
     let attachedTo = null
+    let badSessionCount = 0 // how many times in a row WhatsApp rejected the restored login
     setInterval(() => {
         const sock = provider.vendor
         if (!sock?.ev?.on || sock === attachedTo) return
         attachedTo = sock // a new connection object appears after every reconnect
         sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
             const code = lastDisconnect?.error?.output?.statusCode
+            if (connection) console.log(`🔌 WhatsApp connection: ${connection}${code ? ' (code ' + code + ')' : ''}`)
+            if (code === 440 && connection === 'close') {
+                console.error('⚠️ Code 440: this WhatsApp login is open somewhere else (another running copy of the bot?). Make sure only ONE copy is running.')
+            }
+            if (connection === 'open') badSessionCount = 0
             if (connection === 'close' && code === 401) resetSavedSession('WhatsApp logged this device out (401)')
+            if (connection === 'close' && code === 500 && restoredFromDb && ++badSessionCount >= 3) {
+                resetSavedSession('the saved login looks corrupted (stream error 3 times)')
+            }
         })
     }, 200)
 
@@ -327,14 +336,21 @@ const HOLD_MINUTES = 30 // items are reserved for a customer this long while the
 const LOW_STOCK_ALERT = 5 // customers see "Only N left", and the owner is warned, at this level or below
 const PAYMENT_DETAILS = '0257575551' // e.g. 'MTN MoMo: 024 000 0000 (SNEDA Shopping Center)'
 
-// Owner numbers (OWNER_NUMBER can hold several, separated by commas) receive order alerts and daily reports
-const OWNER_NUMBERS = OWNER_NUMBER.split(',').map((n) => n.replace(/\D/g, '')).filter(Boolean)
+// Owner numbers (OWNER_NUMBER can hold several, separated by commas) receive order alerts and daily reports.
+// A Ghana number written as 0543812261 is turned into 233543812261, which is the format WhatsApp needs.
+const OWNER_NUMBERS = OWNER_NUMBER.split(',')
+    .map((n) => {
+        let d = n.replace(/\D/g, '')
+        if (d.length === 10 && d.startsWith('0')) d = '233' + d.slice(1)
+        return d
+    })
+    .filter(Boolean)
 const isOwner = (from) => OWNER_NUMBERS.includes(String(from).replace(/\D/g, ''))
 
 // =============================================================
 // ⚙️ 3. GROQ AI WITH SUPABASE LIVE INVENTORY & MEMORY
 // =============================================================
-const apiKey = process.env.GROQ_API_KEY || 
+const apiKey = process.env.GROQ_API_KEY
 console.log('Groq key loaded:', !!apiKey)
 const groq = apiKey ? new Groq({ apiKey, timeout: 20000, maxRetries: 1 }) : null
 
@@ -1636,6 +1652,7 @@ function isPaused(ctx) {
         clearPause(id)
         return false
     }
+    console.log(`⏸️ Message from ${id} was NOT answered because the bot is paused for this chat (${Math.ceil((until - Date.now()) / 60000)} min left)`)
     return true
 }
 
@@ -1836,9 +1853,9 @@ async function handleNonText(ctx, { flowDynamic, provider }) {
 // 🛍️ 5. FLOW DEFINITIONS
 // =============================================================
 const orderCaptureFlow = addKeyword(EVENTS.ACTION)
-    .addAction({ capture: true }, async (ctx, { provider, flowDynamic, gotoFlow, flowDynamic: _fd, provider: _pv }) => {
+    .addAction({ capture: true }, async (ctx, { provider, flowDynamic, gotoFlow }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
-        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
+        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
         if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
         if (looksCancel(ctx.body)) return gotoFlow(cancelFlow)
         if (shouldInvoice(ctx.from, ctx.body)) return gotoFlow(invoiceFlow)
@@ -1865,12 +1882,12 @@ const orderPromptFlow = addKeyword(EVENTS.ACTION)
     .addAnswer(
         '🛒 *Great choice!* Reply with the *item number* or *item name* of what you would like. You can add the quantity too (for example: _5 Milo Powder_).',
         { capture: true },
-        async (ctx, { provider, flowDynamic, gotoFlow, flowDynamic: _fd, provider: _pv }) => {
-        if (isPaused(ctx)) return notePausedMessage(ctx)
-        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
+        async (ctx, { provider, flowDynamic, gotoFlow }) => {
+            if (isPaused(ctx)) return notePausedMessage(ctx)
+            if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
             if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
-        if (looksCancel(ctx.body)) return gotoFlow(cancelFlow)
-        if (shouldInvoice(ctx.from, ctx.body)) return gotoFlow(invoiceFlow)
+            if (looksCancel(ctx.body)) return gotoFlow(cancelFlow)
+            if (shouldInvoice(ctx.from, ctx.body)) return gotoFlow(invoiceFlow)
 
             await simulateTyping(ctx, provider, 2000)
             await logCustomerOrderToPg(ctx.from, ctx.body)
@@ -1884,9 +1901,9 @@ const categorySelectionFlow = addKeyword(EVENTS.ACTION)
     .addAnswer(
         'Which category would you like to explore?\n\n1️⃣ *Groceries*\n2️⃣ *Electronics*\n3️⃣ *View Official Web Store*',
         { capture: true },
-        async (ctx, { gotoFlow, provider, flowDynamic, flowDynamic: _fd, provider: _pv }) => {
-        if (isPaused(ctx)) return notePausedMessage(ctx)
-        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
+        async (ctx, { gotoFlow, provider, flowDynamic }) => {
+            if (isPaused(ctx)) return notePausedMessage(ctx)
+            if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
             const input = ctx.body.trim().toLowerCase()
             if (isGreeting(input)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
 
@@ -1936,9 +1953,9 @@ const retailFlow = addKeyword(EVENTS.ACTION)
             '2️⃣ *Browse In-Chat Categories*'
         ].join('\n'),
         { capture: true },
-        async (ctx, { gotoFlow, provider, flowDynamic, flowDynamic: _fd, provider: _pv }) => {
-        if (isPaused(ctx)) return notePausedMessage(ctx)
-        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
+        async (ctx, { gotoFlow, provider, flowDynamic }) => {
+            if (isPaused(ctx)) return notePausedMessage(ctx)
+            if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
             const selection = ctx.body.trim().toLowerCase()
             if (isGreeting(selection)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
 
@@ -1965,9 +1982,9 @@ const wholesaleFlow = addKeyword(EVENTS.ACTION)
             '👉 *Please specify your Business Name and the bulk items/quantities you require:*'
         ].join('\n'),
         { capture: true },
-        async (ctx, { gotoFlow, provider, flowDynamic, flowDynamic: _fd, provider: _pv }) => {
-        if (isPaused(ctx)) return notePausedMessage(ctx)
-        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
+        async (ctx, { gotoFlow, provider, flowDynamic }) => {
+            if (isPaused(ctx)) return notePausedMessage(ctx)
+            if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
             if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
 
             await simulateTyping(ctx, provider, 2000)
@@ -1987,9 +2004,9 @@ const supportFlow = addKeyword(EVENTS.ACTION)
             '👉 *Please type your inquiry below:*'
         ].join('\n'),
         { capture: true },
-        async (ctx, { gotoFlow, provider, flowDynamic, flowDynamic: _fd, provider: _pv }) => {
-        if (isPaused(ctx)) return notePausedMessage(ctx)
-        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
+        async (ctx, { gotoFlow, provider, flowDynamic }) => {
+            if (isPaused(ctx)) return notePausedMessage(ctx)
+            if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
             if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
 
             await simulateTyping(ctx, provider, 2000)
@@ -2000,9 +2017,9 @@ const supportFlow = addKeyword(EVENTS.ACTION)
     )
 
 const invoiceFlow = addKeyword(EVENTS.ACTION)
-    .addAction(async (ctx, { provider, flowDynamic, gotoFlow, flowDynamic: _fd, provider: _pv }) => {
+    .addAction(async (ctx, { provider, flowDynamic, gotoFlow }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
-        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
+        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
         const cart = getCart(ctx.from)
         if (!cart) {
             const resent = await resendLastInvoice(ctx, provider, flowDynamic)
@@ -2029,15 +2046,15 @@ const deliveryDetailsFlow = addKeyword(EVENTS.ACTION)
     .addAnswer(
         '📍 Almost done! Please send your *delivery location* in Accra (area and nearest landmark) so we can complete your invoice:',
         { capture: true },
-        async (ctx, { gotoFlow, flowDynamic: _fd, provider: _pv }) => {
-        if (isPaused(ctx)) return notePausedMessage(ctx)
-        const pin = locationFromCtx(ctx)
-        if (pin) {
-            const cart = getCart(ctx.from)
-            if (cart) cart.location = pin
-            return gotoFlow(invoiceFlow)
-        }
-        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
+        async (ctx, { gotoFlow, flowDynamic, provider }) => {
+            if (isPaused(ctx)) return notePausedMessage(ctx)
+            const pin = locationFromCtx(ctx)
+            if (pin) {
+                const cart = getCart(ctx.from)
+                if (cart) cart.location = pin
+                return gotoFlow(invoiceFlow)
+            }
+            if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
             if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
             const cart = getCart(ctx.from)
             if (cart) cart.location = ctx.body.trim()
@@ -2046,9 +2063,9 @@ const deliveryDetailsFlow = addKeyword(EVENTS.ACTION)
     )
 
 const cancelFlow = addKeyword(EVENTS.ACTION)
-    .addAction(async (ctx, { provider, flowDynamic, gotoFlow, flowDynamic: _fd, provider: _pv }) => {
+    .addAction(async (ctx, { provider, flowDynamic, gotoFlow }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
-        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
+        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
         const cart = getCart(ctx.from)
         if (cart) {
             resetCustomer(ctx.from) // empties the order and gives the reserved items back
@@ -2083,9 +2100,9 @@ const welcomeFlow = addKeyword(EVENTS.ACTION)
             '👉 *Reply with 1, 2, or 3 (or ask any question directly!):*'
         ].join('\n'),
         { capture: true },
-        async (ctx, { gotoFlow, provider, flowDynamic, flowDynamic: _fd, provider: _pv }) => {
-        if (isPaused(ctx)) return notePausedMessage(ctx)
-        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
+        async (ctx, { gotoFlow, provider, flowDynamic }) => {
+            if (isPaused(ctx)) return notePausedMessage(ctx)
+            if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
             const userInput = ctx.body.trim().toLowerCase()
 
             if (userInput === '1' || userInput.includes('retail')) {
@@ -2107,9 +2124,9 @@ const welcomeFlow = addKeyword(EVENTS.ACTION)
 
 // Catches every first message from a customer
 const globalFallbackFlow = addKeyword(EVENTS.WELCOME)
-    .addAction(async (ctx, { provider, flowDynamic, gotoFlow, flowDynamic: _fd, provider: _pv }) => {
+    .addAction(async (ctx, { provider, flowDynamic, gotoFlow }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
-        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic: _fd, provider: _pv })
+        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
         if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
         if (looksCancel(ctx.body)) return gotoFlow(cancelFlow)
         if (shouldInvoice(ctx.from, ctx.body)) return gotoFlow(invoiceFlow)
@@ -2167,6 +2184,12 @@ const main = async () => {
     }, {
         queue: { timeout: 45000, concurrencyLimit: 50 }
     })
+
+    // Log every message that reaches the bot. If a customer texts and you see NO "📩" line here,
+    // the message never arrived (WhatsApp connection or login problem), so it is not a code problem.
+    adapterProvider.on('message', (ctx) =>
+        console.log(`📩 Message received from ${ctx?.from}: ${String(ctx?.body || '').slice(0, 80)}`)
+    )
 
     // ---- Health endpoints (for UptimeRobot) ----
     const sendJson = (res, status, body) => {
