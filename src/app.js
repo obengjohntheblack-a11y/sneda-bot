@@ -19,11 +19,11 @@ process.on('uncaughtException', (err) => console.error('⚠️ Uncaught exceptio
 // 🐘 1. POSTGRESQL (SUPABASE) CONFIGURATION & TABLES
 // =============================================================
 const dbConfig = {
-    host: 'aws-0-eu-west-1.pooler.supabase.com',
-    user: 'postgres.tkdofzunxwmenziqnqma',
-    password: 'wU7p?+35Qd&7z%!',
-    database: 'postgres',
-    port: 6543,
+    host: process.env.POSTGRES_DB_HOST || 'aws-0-eu-west-1.pooler.supabase.com',
+    user: process.env.POSTGRES_DB_USER || 'postgres.tkdofzunxwmenziqnqma',
+    password: process.env.POSTGRES_DB_PASSWORD || 'wU7p?+35Qd&7z%!', // after you reset the password, set POSTGRES_DB_PASSWORD in Render and delete this fallback
+    database: process.env.POSTGRES_DB_NAME || 'postgres',
+    port: Number(process.env.POSTGRES_DB_PORT) || 6543,
     ssl: { rejectUnauthorized: false }
 }
 
@@ -32,7 +32,7 @@ console.log('DB config:', { ...dbConfig, password: '***' })
 
 const pool = new Pool({
     ...dbConfig,
-    max: 5,
+    max: 8,
     connectionTimeoutMillis: 10000,
     query_timeout: 15000,
     idleTimeoutMillis: 30000
@@ -206,6 +206,7 @@ async function logCustomerOrderToPg(userId, orderDetails) {
 // =============================================================
 const SESSION_DIR = path.resolve('bot_sessions')
 const syncedFiles = new Map() // file name -> content already saved in Supabase
+const syncedStats = new Map() // file name -> modified time + size when it was last checked
 let sessionSyncRunning = false
 let sessionResetting = false
 let restoredFromDb = false
@@ -276,20 +277,32 @@ async function backupSessionToDb() {
 
         for (const file of files) {
             if (sessionResetting) break
+            const full = path.join(SESSION_DIR, file)
+            let stat
+            try {
+                stat = fs.statSync(full)
+            } catch {
+                continue
+            }
+            const signature = `${stat.mtimeMs}:${stat.size}`
+            if (syncedStats.get(file) === signature) continue // unchanged since the last check: do not even read it
+
             let content
             try {
-                content = fs.readFileSync(path.join(SESSION_DIR, file), 'utf8')
+                content = fs.readFileSync(full, 'utf8')
                 JSON.parse(content) // skip files that are still being written
             } catch {
                 continue
             }
-            if (syncedFiles.get(file) === content) continue
-            await pool.query(
-                `INSERT INTO wa_session_files (file_name, content) VALUES ($1, $2)
-                 ON CONFLICT (file_name) DO UPDATE SET content = EXCLUDED.content, updated_at = NOW()`,
-                [file, content]
-            )
-            syncedFiles.set(file, content)
+            if (syncedFiles.get(file) !== content) {
+                await pool.query(
+                    `INSERT INTO wa_session_files (file_name, content) VALUES ($1, $2)
+                     ON CONFLICT (file_name) DO UPDATE SET content = EXCLUDED.content, updated_at = NOW()`,
+                    [file, content]
+                )
+                syncedFiles.set(file, content)
+            }
+            syncedStats.set(file, signature)
         }
 
         for (const file of [...syncedFiles.keys()]) {
@@ -297,6 +310,7 @@ async function backupSessionToDb() {
             if (!files.includes(file)) {
                 await pool.query('DELETE FROM wa_session_files WHERE file_name = $1', [file])
                 syncedFiles.delete(file)
+                syncedStats.delete(file)
             }
         }
     } catch (err) {
@@ -328,6 +342,7 @@ async function resetSavedSession(reason) {
             // nothing to remove
         }
         syncedFiles.clear()
+        syncedStats.clear()
     }
     await clearAll()
     await delay(2000)
@@ -784,6 +799,7 @@ async function reserveCart(userId, items) {
     const result = new Map()
     try {
         await client.query('BEGIN')
+        await client.query("SET LOCAL lock_timeout = '4000'") // never wait long for another customer's lock
         const now = Date.now()
         const sorted = [...items].sort((a, b) => a.item_name.localeCompare(b.item_name)) // same lock order for everyone
         for (const it of sorted) {
@@ -895,18 +911,20 @@ async function getGroqCompletion(userId, userMessage) {
 
         userMessage = expandListReferences(userId, userMessage) // "3" becomes the 3rd item shown in the list
 
-        const liveInventory = await getLiveInventoryFromDb(userId)
-        const history = await getChatHistoryFromPg(userId, 12)
-        await saveChatMessageToPg(userId, 'user', userMessage)
+        const [liveInventory, history] = await timed(
+            'database (inventory + chat history)',
+            Promise.all([getLiveInventoryFromDb(userId), getChatHistoryFromPg(userId, 12)])
+        )
+        saveChatMessageToPg(userId, 'user', userMessage) // saved in the background
 
         let orderBlock = ''
         let pricedOrder = null
         if (getCart(userId) || looksLikeOrder(userMessage, history)) {
-            const calc = await calculateOrder(userId, history, userMessage, liveInventory)
+            const calc = await timed('reading the order (AI)', calculateOrder(userId, history, userMessage, liveInventory))
             if (calc) {
                 const cart = getCart(userId)
                 if (cart) {
-                    const reserved = await reserveCart(userId, cart.items) // hold the items for this customer
+                    const reserved = await timed('reserving stock', reserveCart(userId, cart.items)) // hold the items for this customer
                     if (reserved) applyReservation(calc, reserved)
                 }
                 orderBlock = formatOrderBlock(calc)
@@ -962,7 +980,7 @@ STRICT INSTRUCTIONS:
 14. Keep every reply short and about the store only. If the customer wants to go back, change category or start over, tell them they can type *menu* at any time.
 `
 
-        const chatCompletion = await groq.chat.completions.create({
+        const chatCompletion = await timed('AI reply', groq.chat.completions.create({
             messages: [
                 { role: 'system', content: dynamicSystemPrompt },
                 ...history,
@@ -971,13 +989,13 @@ STRICT INSTRUCTIONS:
             model: 'openai/gpt-oss-20b', // llama-3.1-8b-instant was shut down by Groq
             reasoning_effort: 'low',
             temperature: 0.2,
-            max_tokens: 600
-        }, { timeout: 15000, maxRetries: 1 })
+            max_tokens: 800 // the model's thinking also counts here, 600 can cut a long answer short
+        }, { timeout: 15000, maxRetries: 0 }), 5000)
 
         const rawReply = chatCompletion.choices[0]?.message?.content || "How else can I assist you at SNEDA Shopping Center today?"
         const aiReply = formatForWhatsApp(rawReply)
 
-        await saveChatMessageToPg(userId, 'assistant', aiReply)
+        saveChatMessageToPg(userId, 'assistant', aiReply) // saved in the background
         return aiReply
     } catch (error) {
         console.error('❌ Groq API Error:', error?.status, error?.message)
@@ -990,6 +1008,47 @@ STRICT INSTRUCTIONS:
 // =============================================================
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const withTimeout = (promise, ms) => Promise.race([promise, delay(ms)])
+
+// Logs a warning when a step is slow, so the Render logs show exactly what holds the bot up
+async function timed(label, promise, warnAfterMs = 3000) {
+    const t0 = Date.now()
+    try {
+        return await promise
+    } finally {
+        const ms = Date.now() - t0
+        if (ms >= warnAfterMs) console.warn(`⏱️ Slow step: ${label} took ${(ms / 1000).toFixed(1)}s`)
+    }
+}
+
+// Every customer message must be finished before BuilderBot's own limit (45s), otherwise the customer's next
+// messages wait behind it. If a step hangs, give up on it, tell the customer and carry on.
+const HANDLER_DEADLINE_MS = 38000
+function guarded(fn) {
+    return async (ctx, tools) => {
+        const t0 = Date.now()
+        let timer
+        const deadline = new Promise((resolve) => {
+            timer = setTimeout(() => resolve('__deadline__'), HANDLER_DEADLINE_MS)
+        })
+        try {
+            const result = await Promise.race([fn(ctx, tools), deadline])
+            if (result === '__deadline__') {
+                console.error(`⏱️ A step took longer than ${HANDLER_DEADLINE_MS / 1000}s and was stopped (customer ${ctx.from}, message "${String(ctx.body).slice(0, 40)}")`)
+                try {
+                    await withTimeout(tools.flowDynamic('Sorry, that took longer than expected. Please send your message again.'), 5000)
+                } catch {
+                    // ignore
+                }
+                return tools.gotoFlow(orderCaptureFlow)
+            }
+            const ms = Date.now() - t0
+            if (ms > 10000) console.warn(`⏱️ Slow reply: ${(ms / 1000).toFixed(1)}s for customer ${ctx.from} ("${String(ctx.body).slice(0, 40)}")`)
+            return result
+        } finally {
+            clearTimeout(timer)
+        }
+    }
+}
 
 async function simulateTyping(ctx, provider, ms = 1500) {
     try {
@@ -1044,6 +1103,7 @@ function navigationTarget(text, current) {
 // Sends the customer to the place they asked for
 async function goTo(target, ctx, { gotoFlow, flowDynamic }) {
     userLists.delete(ctx.from) // old list numbers must not leak into the next menu
+    if (target === 'welcome') resetCustomer(ctx.from) // starting over also empties the order and releases the reserved stock
 
     if (target === 'groceries' || target === 'electronics') {
         const inventory = await getLiveInventoryFromDb(ctx.from)
@@ -1224,7 +1284,7 @@ async function buildInvoicePdf(inv) {
 async function notifyOwners(provider, text) {
     for (const n of OWNER_NUMBERS) {
         try {
-            await provider.sendMessage(n, text, {})
+            await withTimeout(provider.sendMessage(n, text, {}), 20000)
         } catch (err) {
             console.warn('⚠️ Could not notify the owner:', err?.message)
         }
@@ -1237,6 +1297,7 @@ async function commitSale(userId, cart, { payMethod, paymentStatus, stamp }) {
     const client = await pool.connect()
     try {
         await client.query('BEGIN')
+        await client.query("SET LOCAL lock_timeout = '4000'") // never wait long for another customer's lock
         const now = Date.now()
         const items = [...cart.items].sort((a, b) => a.item_name.localeCompare(b.item_name)) // same lock order for everyone
         const lines = []
@@ -1291,15 +1352,18 @@ async function commitSale(userId, cart, { payMethod, paymentStatus, stamp }) {
     }
 }
 
-// Sends the invoice to the customer (text + PDF)
-async function sendInvoiceMessages(inv, flowDynamic) {
-    await flowDynamic(buildInvoiceText(inv))
-    try {
-        const file = await buildInvoicePdf(inv)
-        if (file) await flowDynamic([{ body: '📄 Your invoice (PDF)', media: file }])
-    } catch (err) {
-        console.error('❌ Invoice PDF failed:', err.message)
-    }
+// Sends the invoice text now. The PDF is sent in the background, so a slow upload can never hold up the conversation.
+async function sendInvoiceMessages(inv, flowDynamic, provider, chatId) {
+    await timed('sending the invoice text', flowDynamic(buildInvoiceText(inv)))
+    ;(async () => {
+        try {
+            const file = await buildInvoicePdf(inv)
+            if (!file) return
+            await timed('sending the invoice PDF', withTimeout(provider.sendMessage(chatId, '📄 Your invoice (PDF)', { media: file }), 60000), 5000)
+        } catch (err) {
+            console.error('❌ Invoice PDF failed:', err.message)
+        }
+    })()
 }
 
 // TODO (when we migrate to Meta Cloud API): send the invoice PDF from a public URL (Meta cannot send local files), and add buttons.
@@ -1314,10 +1378,10 @@ async function issueInvoice(ctx, provider, flowDynamic) {
     const stamp = now.toLocaleDateString('en-CA', { timeZone: 'Africa/Accra' }).replace(/-/g, '')
     const phone = String(ctx.from).replace(/\D/g, '')
 
-    const sale = await commitSale(ctx.from, cart, { payMethod, paymentStatus, stamp })
+    const sale = await timed('saving the sale', commitSale(ctx.from, cart, { payMethod, paymentStatus, stamp }))
     if (!sale) {
         const wanted = cart.items.map((i) => `${i.quantity} × ${i.item_name}`).join(', ')
-        await notifyOwners(provider, `⚠️ *Could not create an invoice* for +${phone}.\nOrder: ${wanted}\nDelivery: ${cart.location || 'not given'}\nPlease contact the customer.`)
+        notifyOwners(provider, `⚠️ *Could not create an invoice* for +${phone}.\nOrder: ${wanted}\nDelivery: ${cart.location || 'not given'}\nPlease contact the customer.`)
         return false
     }
     userCarts.delete(ctx.from)
@@ -1335,7 +1399,7 @@ async function issueInvoice(ctx, provider, flowDynamic) {
         isCash,
         paymentStatus
     }
-    await sendInvoiceMessages(inv, flowDynamic)
+    await sendInvoiceMessages(inv, flowDynamic, provider, ctx.from)
     if (sale.partial) {
         await flowDynamic('⚠️ Some items were no longer available in the full quantity. Our team will contact you about the rest.')
     }
@@ -1343,7 +1407,7 @@ async function issueInvoice(ctx, provider, flowDynamic) {
     const alerts = []
     if (sale.partial) alerts.push('⚠️ PARTIAL ORDER: not everything the customer asked for was available. Please contact the customer.')
     for (const l of sale.lowStock) alerts.push(`📉 Low stock: ${l.item} — ${l.left} left`)
-    await notifyOwners(
+    notifyOwners(
         provider,
         `🔔 *New order ${sale.invoiceNo}*\n${sale.lines.map((l) => `${l.qty} × ${l.item}`).join('\n')}\n*Total:* ${money(sale.total)}\n*Payment:* ${payMethod} (${paymentStatus})\n*Customer:* +${phone}\n*Delivery:* ${cart.location}` +
             (alerts.length ? '\n\n' + alerts.join('\n') : '')
@@ -1386,7 +1450,7 @@ async function resendLastInvoice(ctx, provider, flowDynamic) {
         paymentStatus: r.payment_status
     }
     await flowDynamic('Here is your invoice again 🧾')
-    await sendInvoiceMessages(inv, flowDynamic)
+    await sendInvoiceMessages(inv, flowDynamic, provider, ctx.from)
     return true
 }
 
@@ -1979,7 +2043,7 @@ async function handleNonText(ctx, { flowDynamic, provider }) {
     if (now - (lastNonTextAlert.get(ctx.from) || 0) > 10 * 60 * 1000) {
         lastNonTextAlert.set(ctx.from, now)
         const what = { voice: 'a voice note', media: 'a photo or video', document: 'a file' }[kind] || 'a message'
-        await notifyOwners(provider, `🔔 Customer +${String(ctx.from).replace(/\D/g, '')} sent ${what} that the bot cannot read. Please check the chat.`)
+        notifyOwners(provider, `🔔 Customer +${String(ctx.from).replace(/\D/g, '')} sent ${what} that the bot cannot read. Please check the chat.`)
     }
 }
 
@@ -1987,7 +2051,7 @@ async function handleNonText(ctx, { flowDynamic, provider }) {
 // 🛍️ 5. FLOW DEFINITIONS
 // =============================================================
 const orderCaptureFlow = addKeyword(EVENTS.ACTION)
-    .addAction({ capture: true }, async (ctx, { provider, flowDynamic, gotoFlow }) => {
+    .addAction({ capture: true }, guarded(async (ctx, { provider, flowDynamic, gotoFlow }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
         if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
         if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
@@ -2008,17 +2072,17 @@ const orderCaptureFlow = addKeyword(EVENTS.ACTION)
         }
 
         await simulateTyping(ctx, provider, 1800)
-        await logCustomerOrderToPg(ctx.from, ctx.body)
+        logCustomerOrderToPg(ctx.from, ctx.body)
         const aiResponse = await getGroqCompletion(ctx.from, ctx.body)
         await flowDynamic(aiResponse)
         return gotoFlow(orderCaptureFlow)
-    })
+    }))
 
 const orderPromptFlow = addKeyword(EVENTS.ACTION)
     .addAnswer(
         '🛒 *Great choice!* Reply with the *item number* or *item name* of what you would like. You can add the quantity too (for example: _5 Milo Powder_).',
         { capture: true },
-        async (ctx, { provider, flowDynamic, gotoFlow }) => {
+        guarded(async (ctx, { provider, flowDynamic, gotoFlow }) => {
             if (isPaused(ctx)) return notePausedMessage(ctx)
             if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
             if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
@@ -2028,18 +2092,18 @@ const orderPromptFlow = addKeyword(EVENTS.ACTION)
             if (shouldInvoice(ctx.from, ctx.body)) return gotoFlow(invoiceFlow)
 
             await simulateTyping(ctx, provider, 2000)
-            await logCustomerOrderToPg(ctx.from, ctx.body)
+            logCustomerOrderToPg(ctx.from, ctx.body)
             const aiResponse = await getGroqCompletion(ctx.from, ctx.body)
             await flowDynamic(aiResponse)
             return gotoFlow(orderCaptureFlow)
-        }
+        })
     )
 
 const categorySelectionFlow = addKeyword(EVENTS.ACTION)
     .addAnswer(
         'Which category would you like to explore?\n\n1️⃣ *Groceries*\n2️⃣ *Electronics*\n3️⃣ *View Official Web Store*',
         { capture: true },
-        async (ctx, { gotoFlow, provider, flowDynamic }) => {
+        guarded(async (ctx, { gotoFlow, provider, flowDynamic }) => {
             if (isPaused(ctx)) return notePausedMessage(ctx)
             if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
             const input = ctx.body.trim().toLowerCase()
@@ -2079,7 +2143,7 @@ const categorySelectionFlow = addKeyword(EVENTS.ACTION)
                 await flowDynamic(aiReply)
                 return gotoFlow(orderCaptureFlow)
             }
-        }
+        })
     )
 
 const retailFlow = addKeyword(EVENTS.ACTION)
@@ -2093,7 +2157,7 @@ const retailFlow = addKeyword(EVENTS.ACTION)
             '2️⃣ *Browse In-Chat Categories*'
         ].join('\n'),
         { capture: true },
-        async (ctx, { gotoFlow, provider, flowDynamic }) => {
+        guarded(async (ctx, { gotoFlow, provider, flowDynamic }) => {
             if (isPaused(ctx)) return notePausedMessage(ctx)
             if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
             const selection = ctx.body.trim().toLowerCase()
@@ -2112,7 +2176,7 @@ const retailFlow = addKeyword(EVENTS.ACTION)
                 await flowDynamic(aiReply)
                 return gotoFlow(orderCaptureFlow)
             }
-        }
+        })
     )
 
 const wholesaleFlow = addKeyword(EVENTS.ACTION)
@@ -2124,7 +2188,7 @@ const wholesaleFlow = addKeyword(EVENTS.ACTION)
             '👉 *Please specify your Business Name and the bulk items/quantities you require:*'
         ].join('\n'),
         { capture: true },
-        async (ctx, { gotoFlow, provider, flowDynamic }) => {
+        guarded(async (ctx, { gotoFlow, provider, flowDynamic }) => {
             if (isPaused(ctx)) return notePausedMessage(ctx)
             if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
             if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
@@ -2132,11 +2196,11 @@ const wholesaleFlow = addKeyword(EVENTS.ACTION)
             if (nav) return goTo(nav, ctx, { gotoFlow, flowDynamic })
 
             await simulateTyping(ctx, provider, 2000)
-            await logCustomerOrderToPg(ctx.from, `WHOLESALE INQUIRY: ${ctx.body}`)
+            logCustomerOrderToPg(ctx.from, `WHOLESALE INQUIRY: ${ctx.body}`)
             const aiResponse = await getGroqCompletion(ctx.from, `Wholesale inquiry: ${ctx.body}`)
             await flowDynamic(aiResponse)
             return gotoFlow(orderCaptureFlow)
-        }
+        })
     )
 
 const supportFlow = addKeyword(EVENTS.ACTION)
@@ -2148,7 +2212,7 @@ const supportFlow = addKeyword(EVENTS.ACTION)
             '👉 *Please type your inquiry below:*'
         ].join('\n'),
         { capture: true },
-        async (ctx, { gotoFlow, provider, flowDynamic }) => {
+        guarded(async (ctx, { gotoFlow, provider, flowDynamic }) => {
             if (isPaused(ctx)) return notePausedMessage(ctx)
             if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
             if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
@@ -2159,11 +2223,11 @@ const supportFlow = addKeyword(EVENTS.ACTION)
             const aiResponse = await getGroqCompletion(ctx.from, ctx.body)
             await flowDynamic(aiResponse)
             return gotoFlow(orderCaptureFlow)
-        }
+        })
     )
 
 const invoiceFlow = addKeyword(EVENTS.ACTION)
-    .addAction(async (ctx, { provider, flowDynamic, gotoFlow }) => {
+    .addAction(guarded(async (ctx, { provider, flowDynamic, gotoFlow }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
         if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
         const cart = getCart(ctx.from)
@@ -2186,13 +2250,13 @@ const invoiceFlow = addKeyword(EVENTS.ACTION)
         const ok = await issueInvoice(ctx, provider, flowDynamic)
         if (!ok) await flowDynamic('Sorry, I could not generate your invoice. A sales representative will help you shortly.')
         return gotoFlow(orderCaptureFlow)
-    })
+    }))
 
 const deliveryDetailsFlow = addKeyword(EVENTS.ACTION)
     .addAnswer(
         '📍 Almost done! Please send your *delivery location* in Accra (area and nearest landmark) so we can complete your invoice:',
         { capture: true },
-        async (ctx, { gotoFlow, flowDynamic, provider }) => {
+        guarded(async (ctx, { gotoFlow, flowDynamic, provider }) => {
             if (isPaused(ctx)) return notePausedMessage(ctx)
             const pin = locationFromCtx(ctx)
             if (pin) {
@@ -2205,11 +2269,11 @@ const deliveryDetailsFlow = addKeyword(EVENTS.ACTION)
             const cart = getCart(ctx.from)
             if (cart) cart.location = ctx.body.trim()
             return gotoFlow(invoiceFlow)
-        }
+        })
     )
 
 const cancelFlow = addKeyword(EVENTS.ACTION)
-    .addAction(async (ctx, { provider, flowDynamic, gotoFlow }) => {
+    .addAction(guarded(async (ctx, { provider, flowDynamic, gotoFlow }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
         if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
         const cart = getCart(ctx.from)
@@ -2220,13 +2284,13 @@ const cancelFlow = addKeyword(EVENTS.ACTION)
         }
         const last = await getRecentInvoice(ctx.from)
         if (last) {
-            await notifyOwners(provider, `⚠️ *Cancellation request* from +${String(ctx.from).replace(/\D/g, '')} for invoice ${last.invoice_no} (${money(Number(last.total))}). Please contact the customer.`)
+            notifyOwners(provider, `⚠️ *Cancellation request* from +${String(ctx.from).replace(/\D/g, '')} for invoice ${last.invoice_no} (${money(Number(last.total))}). Please contact the customer.`)
             await flowDynamic(`I have passed your request about invoice *${last.invoice_no}* to our team. They will contact you shortly.`)
         } else {
             await flowDynamic(await getGroqCompletion(ctx.from, ctx.body))
         }
         return gotoFlow(orderCaptureFlow)
-    })
+    }))
 
 // =============================================================
 // 🛒 6. WELCOME MENU (reached only through gotoFlow, no keywords)
@@ -2246,7 +2310,7 @@ const welcomeFlow = addKeyword(EVENTS.ACTION)
             '👉 *Reply with 1, 2, or 3 (or ask any question directly!):*'
         ].join('\n'),
         { capture: true },
-        async (ctx, { gotoFlow, provider, flowDynamic }) => {
+        guarded(async (ctx, { gotoFlow, provider, flowDynamic }) => {
             if (isPaused(ctx)) return notePausedMessage(ctx)
             if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
             const userInput = ctx.body.trim().toLowerCase()
@@ -2265,12 +2329,12 @@ const welcomeFlow = addKeyword(EVENTS.ACTION)
             const aiReply = await getGroqCompletion(ctx.from, ctx.body)
             await flowDynamic(aiReply)
             return gotoFlow(orderCaptureFlow)
-        }
+        })
     )
 
 // Catches every first message from a customer
 const globalFallbackFlow = addKeyword(EVENTS.WELCOME)
-    .addAction(async (ctx, { provider, flowDynamic, gotoFlow }) => {
+    .addAction(guarded(async (ctx, { provider, flowDynamic, gotoFlow }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
         if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
         if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
@@ -2292,7 +2356,7 @@ const globalFallbackFlow = addKeyword(EVENTS.WELCOME)
         const aiReply = await getGroqCompletion(ctx.from, ctx.body)
         await flowDynamic(aiReply)
         return gotoFlow(orderCaptureFlow)
-    })
+    }))
 
 // =============================================================
 // 🚀 7. BOT INITIALIZATION
