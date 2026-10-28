@@ -439,7 +439,7 @@ const REPORT_FORMATS = ['xlsx', 'pdf'] // choose any of: 'xlsx' (Excel), 'pdf'
 const HUMAN_TAKEOVER = true // pause the bot in a chat when a person replies from the phone
 const HUMAN_PAUSE_MINUTES = 30 // the bot stays quiet until the person has been silent this long
 const HOLD_MINUTES = 35 // items are reserved for a customer this long while they pay
-const LOW_STOCK_ALERT = 5 // customers see "Only N left", and the owner is warned, at this level or below
+const LOW_STOCK_ALERT = 15 // customers see "Only N left", and the owner is warned, at this level or below
 const PAYMENT_DETAILS = '0257575551' // e.g. 'MTN MoMo: 024 000 0000 (SNEDA Shopping Center)'
 
 // Owner numbers (OWNER_NUMBER can hold several, separated by commas) receive order alerts and daily reports.
