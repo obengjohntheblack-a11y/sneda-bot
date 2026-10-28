@@ -153,10 +153,20 @@ async function saveChatMessageToPg(userId, role, content) {
     }
 }
 
+// Writes an invisible "marker" into the chat history. The AI only ever sees messages AFTER the last marker,
+// so a finished order (invoice issued, cancelled, or start over) can never leak into the next conversation.
+function markConversationEnd(userId) {
+    pool.query("INSERT INTO chat_history (user_id, role, content) VALUES ($1, 'marker', 'end')", [userId])
+        .catch((err) => console.error('❌ Could not mark the end of a conversation:', err.message))
+}
+
 async function getChatHistoryFromPg(userId, limit = 12) {
     try {
         const res = await pool.query(
-            'SELECT role, content FROM chat_history WHERE user_id = $1 ORDER BY id DESC LIMIT $2',
+            `SELECT role, content FROM chat_history
+             WHERE user_id = $1 AND role <> 'marker'
+               AND id > COALESCE((SELECT MAX(id) FROM chat_history WHERE user_id = $1 AND role = 'marker'), 0)
+             ORDER BY id DESC LIMIT $2`,
             [userId, limit]
         )
         return res.rows.reverse()
@@ -464,6 +474,11 @@ const money = (n) => {
     return `GH₵ ${whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}.${dec}`
 }
 
+// "thanks", "okay thanks", "bye" ... and plain "ok", "sure", "yes" when nothing is being ordered
+const THANKS_OR_BYE = /^\s*(?:(?:ok(?:ay)?|alright|all\s+right|fine|great|cool|nice|good|noted|got\s+it|sure)[\s,.!]+)?(?:thanks?|thank\s+you|thanx|thx|ty|bye|goodbye|see\s+you(?:\s+later)?|that'?s\s+all|nothing\s+else|i'?m\s+done|no\s+thanks?|no\s+thank\s+you)(?:[\s,.!]+(?:so\s+much|very\s+much|a\s+lot|again|please|bye|goodbye|thanks?|thank\s+you|ok(?:ay)?|then))*[\s.!]*$/i
+const AFFIRM_ONLY = /^\s*(?:ok(?:ay)?|alright|all\s+right|fine|great|cool|nice|good|noted|got\s+it|sure|yes|yeah|yep|yup|k)(?:[\s,.!]+(?:please|then|sure))*[\s.!]*$/i
+const closingKind = (m) => (THANKS_OR_BYE.test(m) ? 'thanks' : AFFIRM_ONLY.test(m) ? 'affirm' : null)
+
 const looksLikeOrder = (msg, history) =>
     /\d|order|buy|want|need|take|get|pay|momo|mobile money|cash|deliver|total|how much/i.test(msg) ||
     history.slice(-6).some((m) => m.role === 'user' && /\d/.test(m.content))
@@ -595,6 +610,7 @@ async function calculateOrder(userId, history, userMessage, inventory) {
                             'If the customer has not said how many, use quantity 1. ' +
                             'delivery_location is the place the customer wants the order delivered to (an area, address or landmark), only if they clearly said it, otherwise null. ' +
                             'If the customer clearly starts a different order, return only the new items. ' +
+                            'The conversation so far may be empty or may only contain a new order. Never bring back an order from earlier that the customer is no longer talking about. ' +
                             'If nothing has been chosen yet, reply {"items":[],"delivery_location":null}. Never calculate prices.'
                     },
                     { role: 'user', content: `Conversation so far:\n${recent}\n\nLatest customer message: ${userMessage}` }
@@ -658,9 +674,9 @@ function formatOrderBlock(calc) {
     const lines = calc.lines.map((l) => {
         if (l.enough) return `- ${l.qty} × ${l.item} @ ${money(l.unit)} = ${money(l.subtotal)}`
         if (l.sellable > 0) {
-            return `- ${l.item}: customer wants ${l.qty} but ONLY ${l.sellable} ARE AVAILABLE. Priced for ${l.sellable}: ${l.sellable} × ${money(l.unit)} = ${money(l.subtotal)} ⚠️ Tell the customer only ${l.sellable} can be supplied and ask if they want that instead`
+            return `- ${l.item}: customer wanted ${l.qty} but ONLY ${l.sellable} ARE AVAILABLE. The order was reduced to ${l.sellable} × ${money(l.unit)} = ${money(l.subtotal)}. ⚠️ Tell the customer only ${l.sellable} can be supplied and the order now has ${l.sellable}. They can say "cancel" if they do not want it`
         }
-        return `- ${l.item}: OUT OF STOCK ⚠️ Tell the customer it is not available now and suggest an alternative`
+        return `- ${l.item}: OUT OF STOCK. It was REMOVED from the order. ⚠️ Tell the customer once that it is not available now, suggest a similar item, and ask what else they would like`
     })
     return `
 VERIFIED ORDER CALCULATION (calculated by the system — use these exact numbers):
@@ -792,6 +808,7 @@ function resetCustomer(userId) {
     userCarts.delete(userId)
     userLists.delete(userId)
     releaseHolds(userId)
+    markConversationEnd(userId)
 }
 
 // Reserves what is available. Returns Map(item lower-case -> { requested, held, available }) or null if the database failed.
@@ -910,6 +927,13 @@ async function getGroqCompletion(userId, userMessage) {
             return "Welcome to *SNEDA Shopping Center*! How can I assist you today?"
         }
 
+        // Nothing is being ordered and the customer just says thanks / ok / sure: answer in code (no AI, no repeats)
+        if (!getCart(userId)) {
+            const closing = closingKind(userMessage)
+            if (closing === 'thanks') return "You're welcome! 😊 If you need anything else, just type the item you want, or type *menu*."
+            if (closing === 'affirm') return 'Sure! 😊 What would you like to order? Type the item name and quantity, or type *menu* to browse.'
+        }
+
         userMessage = expandListReferences(userId, userMessage) // "3" becomes the 3rd item shown in the list
 
         const [liveInventory, history] = await timed(
@@ -930,6 +954,31 @@ async function getGroqCompletion(userId, userMessage) {
                 }
                 orderBlock = formatOrderBlock(calc)
                 pricedOrder = calc
+
+                // Items that cannot be supplied are taken out (or reduced) right now. Otherwise the order stays
+                // stuck on the unavailable item and every later message gets the same "not in stock" answer.
+                if (cart && calc.lines.some((l) => !l.enough)) {
+                    const live = getCart(userId)
+                    if (live) {
+                        for (const l of calc.lines.filter((x) => !x.enough)) {
+                            const it = live.items.find((i) => i.item_name === l.item)
+                            if (it) it.quantity = l.sellable
+                        }
+                        live.items = live.items.filter((i) => i.quantity > 0)
+                        calc.lines = calc.lines.filter((l) => l.sellable > 0)
+                        for (const l of calc.lines) {
+                            l.qty = l.sellable
+                            l.enough = true
+                        }
+                        if (!live.items.length) {
+                            resetCustomer(userId) // nothing left to order: the customer can start something new
+                            pricedOrder = null
+                        } else {
+                            live.awaiting = null
+                            live.pending = null
+                        }
+                    }
+                }
             }
         }
 
@@ -979,6 +1028,7 @@ STRICT INSTRUCTIONS:
 12. If a customer wants to change an order, confirm the change. If they want to cancel an order that already has an invoice, tell them a team member will help them.
 13. Follow the NEXT STEP in the order section exactly, one step at a time. Do not skip ahead, and do not suggest other products while the customer is in the middle of an order.
 14. Keep every reply short and about the store only. If the customer wants to go back, change category or start over, tell them they can type *menu* at any time.
+15. NEVER repeat your previous reply word for word. If an item is out of stock, say so once, then help the customer choose something else. If the customer only says thanks, okay or sure, answer in one short friendly sentence and invite them to type an item name or *menu*. When an order has been invoiced it is finished: do not bring it up again unless the customer asks about it.
 `
 
         const chatCompletion = await timed('AI reply', groq.chat.completions.create({
@@ -1387,6 +1437,7 @@ async function issueInvoice(ctx, provider, flowDynamic) {
     }
     userCarts.delete(ctx.from)
     persistedCarts.delete(ctx.from)
+    markConversationEnd(ctx.from) // the order is finished: later messages ("thanks", "ok") must not reopen it
 
     const inv = {
         invoiceNo: sale.invoiceNo,
