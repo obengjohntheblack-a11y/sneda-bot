@@ -439,7 +439,8 @@ const REPORT_FORMATS = ['xlsx', 'pdf'] // choose any of: 'xlsx' (Excel), 'pdf'
 const HUMAN_TAKEOVER = true // pause the bot in a chat when a person replies from the phone
 const HUMAN_PAUSE_MINUTES = 30 // the bot stays quiet until the person has been silent this long
 const HOLD_MINUTES = 35 // items are reserved for a customer this long while they pay
-const LOW_STOCK_ALERT = 15 // customers see "Only N left", and the owner is warned, at this level or below
+const OWNER_ORDER_ALERTS = true // true = the owner gets a short alert for every new order. false = only problems (low stock, partial orders)
+const LOW_STOCK_ALERT = 5 // customers see "Only N left", and the owner is warned, at this level or below
 const PAYMENT_DETAILS = '0257575551' // e.g. 'MTN MoMo: 024 000 0000 (SNEDA Shopping Center)'
 
 // Owner numbers (OWNER_NUMBER can hold several, separated by commas) receive order alerts and daily reports.
@@ -1484,11 +1485,17 @@ async function issueInvoice(ctx, provider, flowDynamic) {
     const alerts = []
     if (sale.partial) alerts.push('⚠️ PARTIAL ORDER: not everything the customer asked for was available. Please contact the customer.')
     for (const l of sale.lowStock) alerts.push(`📉 Low stock: ${l.item} — ${l.left} left`)
-    notifyOwners(
-        provider,
-        `🔔 *New order ${sale.invoiceNo}*\n${sale.lines.map((l) => `${l.qty} × ${l.item}`).join('\n')}\n*Total:* ${money(sale.total)}\n*Payment:* ${payMethod} (${paymentStatus})\n*Customer:* +${phone}\n*Delivery:* ${cart.location}` +
-            (alerts.length ? '\n\n' + alerts.join('\n') : '')
-    )
+    // The owner gets a short alert for every order. If the customer IS the owner (a test order), they already
+    // see the invoice in this chat, so only real problems (low stock, partial order) are sent.
+    if (OWNER_ORDER_ALERTS && !isOwner(ctx.from)) {
+        notifyOwners(
+            provider,
+            `🔔 *New order ${sale.invoiceNo}*\n${sale.lines.map((l) => `${l.qty} × ${l.item}`).join('\n')}\n*Total:* ${money(sale.total)}\n*Payment:* ${payMethod} (${paymentStatus})\n*Customer:* +${phone}\n*Delivery:* ${cart.location}` +
+                (alerts.length ? '\n\n' + alerts.join('\n') : '')
+        )
+    } else if (alerts.length) {
+        notifyOwners(provider, `⚠️ *Order ${sale.invoiceNo}*\n${alerts.join('\n')}`)
+    }
 
     console.log(`🧾 Invoice ${sale.invoiceNo} issued to ${ctx.from}`)
     return true
