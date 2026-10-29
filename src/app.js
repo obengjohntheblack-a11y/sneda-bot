@@ -2639,7 +2639,7 @@ const main = async () => {
     // ---- Save unfinished orders every 5 seconds, and save everything when the host stops the bot ----
     setInterval(() => persistCarts().catch((err) => console.error('❌ Saving orders failed:', err.message)), 5000)
     setInterval(() => pool.query('DELETE FROM stock_holds WHERE expires_at < $1', [Date.now() - 86400000]).catch(() => {}), 60 * 60 * 1000)
-    const cleanOldChats = () => pool.query("DELETE FROM chat_history WHERE created_at < NOW() - INTERVAL '60 days'").catch((err) => console.error('❌ Could not clean old chats:', err.message))
+    const cleanOldChats = () => pool.query("DELETE FROM chat_history WHERE created_at < NOW() - INTERVAL '180 days'").catch((err) => console.error('❌ Could not clean old chats:', err.message))
     setTimeout(cleanOldChats, 5 * 60 * 1000) // once shortly after every start (the bot may restart more often than once a day)
     setInterval(cleanOldChats, 24 * 60 * 60 * 1000) // and then every day
     process.on('SIGTERM', async () => {
