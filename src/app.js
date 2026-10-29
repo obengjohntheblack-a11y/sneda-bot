@@ -974,8 +974,13 @@ async function getGroqCompletion(userId, userMessage) {
                             l.qty = l.sellable
                             l.enough = true
                         }
-                        if (!live.items.length) {
-                            resetCustomer(userId) // nothing left to order: the customer can start something new
+                             if (!live.items.length) {
+                            // empty the order but keep the numbered list, so the customer can pick another number
+                            userCarts.delete(userId)
+                            releaseHolds(userId)
+                            markConversationEnd(userId)
+                            const shown = userLists.get(userId)
+                            if (shown) shown.awaiting = true
                             pricedOrder = null
                         } else {
                             live.awaiting = null
