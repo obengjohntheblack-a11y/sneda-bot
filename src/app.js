@@ -407,7 +407,7 @@ function startSessionGuard(provider) {
         })
     }, 200)
 
-    // Stuck check: not connected and no QR code to scan. A login that was never linked gets 3 minutes;
+    // Stuck check: not connected and no QR code to scan. A login that was never linked gets 8 minutes;
     // a linked login gets 10 minutes (so a short WhatsApp outage never wipes a good login).
     let stuckSince = null
     setInterval(() => {
@@ -419,7 +419,7 @@ function startSessionGuard(provider) {
             return
         }
         stuckSince = stuckSince || Date.now()
-        const limit = sessionIsLinked() ? 10 * 60 * 1000 : 3 * 60 * 1000
+        const limit = sessionIsLinked() ? 10 * 60 * 1000 : 8 * 60 * 1000
         if (Date.now() - stuckSince > limit) resetSavedSession('not connected and no QR code appeared')
     }, 30 * 1000)
 }
@@ -974,7 +974,7 @@ async function getGroqCompletion(userId, userMessage) {
                             l.qty = l.sellable
                             l.enough = true
                         }
-                             if (!live.items.length) {
+                        if (!live.items.length) {
                             // empty the order but keep the numbered list, so the customer can pick another number
                             userCarts.delete(userId)
                             releaseHolds(userId)
@@ -1081,7 +1081,7 @@ STRICT INSTRUCTIONS:
         return aiReply
     } catch (error) {
         console.error('❌ Groq API Error:', error?.status, error?.message)
-        return "I'd be happy to check our current inventory for that! Let me connect you with a sales representative, or you can browse our full catalog at " + DIGITAL_CATALOG_URL
+        return "Sorry, I'm having a little trouble right now. 🙏 Please send your message again in a moment, or browse our catalog at " + DIGITAL_CATALOG_URL
     }
 }
 
@@ -2639,6 +2639,9 @@ const main = async () => {
     // ---- Save unfinished orders every 5 seconds, and save everything when the host stops the bot ----
     setInterval(() => persistCarts().catch((err) => console.error('❌ Saving orders failed:', err.message)), 5000)
     setInterval(() => pool.query('DELETE FROM stock_holds WHERE expires_at < $1', [Date.now() - 86400000]).catch(() => {}), 60 * 60 * 1000)
+    const cleanOldChats = () => pool.query("DELETE FROM chat_history WHERE created_at < NOW() - INTERVAL '60 days'").catch((err) => console.error('❌ Could not clean old chats:', err.message))
+    setTimeout(cleanOldChats, 5 * 60 * 1000) // once shortly after every start (the bot may restart more often than once a day)
+    setInterval(cleanOldChats, 24 * 60 * 60 * 1000) // and then every day
     process.on('SIGTERM', async () => {
         try {
             await persistCarts()
