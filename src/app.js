@@ -89,6 +89,9 @@ async function initDbTables() {
             );
         `)
 
+        await pool.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS payment_proof TEXT')
+        await pool.query('ALTER TABLE invoices ADD COLUMN IF NOT EXISTS payment_reference VARCHAR(60)')
+
         await pool.query(`
             CREATE TABLE IF NOT EXISTS wa_session_files (
                 file_name TEXT PRIMARY KEY,
@@ -439,7 +442,10 @@ const REPORT_FORMATS = ['xlsx', 'pdf'] // choose any of: 'xlsx' (Excel), 'pdf'
 const HUMAN_TAKEOVER = true // pause the bot in a chat when a person replies from the phone
 const HUMAN_PAUSE_MINUTES = 30 // the bot stays quiet until the person has been silent this long
 const HOLD_MINUTES = 35 // items are reserved for a customer this long while they pay
+const LOG_MESSAGES = String(process.env.LOG_MESSAGES).toLowerCase() === 'true' // false = customer message text is NOT written to the logs
+const preview = (text, n = 40) => (LOG_MESSAGES ? String(text ?? '').slice(0, n) : '(hidden)')
 const OWNER_ORDER_ALERTS = true // true = the owner gets a short alert for every new order. false = only problems (low stock, partial orders)
+const VOIDED_STATUS = 'Voided by owner' // payment_status written by the owner command: void INV-...
 const LOW_STOCK_ALERT = 5 // customers see "Only N left", and the owner is warned, at this level or below
 const PAYMENT_DETAILS = '0257575551' // e.g. 'MTN MoMo: 024 000 0000 (SNEDA Shopping Center)'
 
@@ -460,6 +466,41 @@ const isOwner = (from) => OWNER_NUMBERS.includes(String(from).replace(/\D/g, '')
 const apiKey = process.env.GROQ_API_KEY
 console.log('Groq key loaded:', !!apiKey)
 const groq = apiKey ? new Groq({ apiKey, timeout: 20000, maxRetries: 1 }) : null
+
+// ---- AI calls: at most AI_MAX_PARALLEL run at once (the rest wait their turn), and a "too many requests" (429)
+// answer from Groq is retried once after a short wait. This protects the free Groq plan when several customers write together.
+const AI_MAX_PARALLEL = 4
+let aiActive = 0
+const aiWaiting = []
+async function acquireAiSlot() {
+    if (aiActive < AI_MAX_PARALLEL) {
+        aiActive++
+        return
+    }
+    await new Promise((resolve) => aiWaiting.push(resolve)) // the slot is handed over directly when someone finishes
+}
+function releaseAiSlot() {
+    const next = aiWaiting.shift()
+    if (next) next()
+    else aiActive--
+}
+async function groqChat(body, options) {
+    await acquireAiSlot()
+    try {
+        try {
+            return await groq.chat.completions.create(body, options)
+        } catch (err) {
+            if (err?.status !== 429) throw err
+            const asked = Number(err?.headers?.['retry-after'])
+            const wait = Math.min(Number.isFinite(asked) && asked > 0 ? asked * 1000 : 2000, 4000)
+            console.warn(`⏳ Groq says "too many requests" (429). Waiting ${(wait / 1000).toFixed(1)}s and trying once more...`)
+            await delay(wait)
+            return await groq.chat.completions.create(body, options)
+        }
+    } finally {
+        releaseAiSlot()
+    }
+}
 
 // =============================================================
 // 🧮 ORDER MATHS — done in code, never by the AI
@@ -592,7 +633,7 @@ async function calculateOrder(userId, history, userMessage, inventory) {
             const recent = history.slice(-8).map((m) => `${m.role}: ${m.content}`).join('\n')
             const names = inventory.map((i) => i.item_name)
 
-            const res = await groq.chat.completions.create({
+            const res = await groqChat({
                 model: 'openai/gpt-oss-20b',
                 reasoning_effort: 'low',
                 temperature: 0,
@@ -708,7 +749,7 @@ function nextStep(cart, calc) {
     }
     return {
         kind: 'summary',
-        text: '\nNEXT STEP: Everything is known. Show the final order summary (items, total, payment method, delivery location). For Mobile Money or Card, give the payment details and ask them to reply *PAID* after paying. For Cash on Delivery, ask them to reply *CONFIRM ORDER*.\n'
+        text: '\nNEXT STEP: Everything is known. Show the final order summary (items, total, payment method, delivery location). For Mobile Money or Card, give the payment details and ask them to reply *PAID* (or I have paid, done, sent) after paying AND to attach their Mobile Money transaction message (a screenshot, or the SMS text) so we can confirm the payment. For Cash on Delivery, ask them to reply *CONFIRM ORDER*.\n'
     }
 }
 
@@ -930,6 +971,7 @@ async function getGroqCompletion(userId, userMessage) {
         if (!groq) {
             return "Welcome to *SNEDA Shopping Center*! How can I assist you today?"
         }
+        const startedAt = Date.now() // used to keep the whole answer inside the 38 second limit
 
         // Nothing is being ordered and the customer just says thanks / ok / sure: answer in code (no AI, no repeats)
         if (!getCart(userId)) {
@@ -1003,6 +1045,7 @@ async function getGroqCompletion(userId, userMessage) {
         if (cartNow && pricedOrder) {
             const step = nextStep(cartNow, pricedOrder)
             cartNow.awaiting = step.kind === 'quantity' ? 'quantity' : step.kind === 'location' ? 'location' : null
+            if (step.kind === 'summary' && cartNow.payment && cartNow.payment !== 'Cash on Delivery') cartNow.proofExpected = true // from now on a screenshot or "done" means "I paid"
             orderBlock += step.text
         }
 
@@ -1030,7 +1073,7 @@ STRICT INSTRUCTIONS:
 4. Keep answers conversational, warm, and optimized for WhatsApp. Use WhatsApp formatting only: *single asterisks* for bold (prices, item names, totals). NEVER use **double asterisks**, # headings, markdown tables or --- lines.
 5. NEVER do arithmetic yourself. If a VERIFIED ORDER CALCULATION section is present, use its exact quantities, line totals and total. When the customer gives a payment method or asks for the total, confirm the order with the full breakdown (quantity × unit price = line total) and the TOTAL FOR ITEMS.
 6. If no VERIFIED ORDER CALCULATION is present and the customer asks for a total, ask which item and how many units they want. If an item shows a stock warning, tell the customer how many are available.
-7. Once the customer has chosen a payment method and you have shown the total, explain how to pay (use the payment details above only) and ask them to reply *PAID* once they have paid, so their invoice can be generated. For Cash on Delivery, ask them to reply *CONFIRM ORDER*.
+7. Once the customer has chosen a payment method and you have shown the total, explain how to pay (use the payment details above only) and ask them to reply *PAID* (or "I have paid", "done", "sent") once they have paid AND to attach their Mobile Money transaction message (a screenshot, or the SMS text) so we can confirm the payment and generate their invoice. For Cash on Delivery, ask them to reply *CONFIRM ORDER*.
 8. When the customer asks how to pay or for the payment number, answer that directly using the payment details above. Do not use numbered lists for payment steps (use bullets), and do not mention payment reference numbers unless the payment details include one.
 9. A reply that is only a number or an option, such as '1', '1 please' or 'option 2', is a menu choice, NOT a quantity. Never change or question the order quantity unless the customer clearly says so (for example 'make it 5'). If you are not sure what the number refers to, ask which option they mean.
 10. Do not number your own product lists (use bullets), because customers may reply with a number from the store's numbered menu.
@@ -1041,7 +1084,7 @@ STRICT INSTRUCTIONS:
 15. NEVER repeat your previous reply word for word. If an item is out of stock, say so once, then help the customer choose something else. If the customer only says thanks, okay or sure, answer in one short friendly sentence and invite them to type an item name or *menu*. When an order has been invoiced it is finished: do not bring it up again unless the customer asks about it.
 `
 
-        const chatCompletion = await timed('AI reply', groq.chat.completions.create({
+        const chatCompletion = await timed('AI reply', groqChat({
             messages: [
                 { role: 'system', content: dynamicSystemPrompt },
                 ...history,
@@ -1057,9 +1100,9 @@ STRICT INSTRUCTIONS:
 
         // Safety net: the AI sometimes gives the "I can only help with SNEDA products" reply to a real shopping request
         // (for example "can I get sausages"). Ask once more, with a clear note that this is on-topic.
-        if (/can only help with (?:SNEDA|our store)/i.test(rawReply) && SHOPPING_REQUEST.test(userMessage)) {
+        if (/can only help with (?:SNEDA|our store)/i.test(rawReply) && SHOPPING_REQUEST.test(userMessage) && Date.now() - startedAt < 22000) {
             try {
-                const retry = await timed('AI retry (shopping request)', groq.chat.completions.create({
+                const retry = await timed('AI retry (shopping request)', groqChat({
                     messages: [
                         { role: 'system', content: dynamicSystemPrompt },
                         ...history,
@@ -1069,7 +1112,7 @@ STRICT INSTRUCTIONS:
                     reasoning_effort: 'low',
                     temperature: 0.2,
                     max_tokens: 800
-                }, { timeout: 15000, maxRetries: 0 }), 5000)
+                }, { timeout: Math.min(15000, 34000 - (Date.now() - startedAt)), maxRetries: 0 }), 5000)
                 rawReply = retry.choices[0]?.message?.content || rawReply
             } catch (err) {
                 console.warn('⚠️ AI retry failed:', err?.message)
@@ -1115,7 +1158,7 @@ function guarded(fn) {
         try {
             const result = await Promise.race([fn(ctx, tools), deadline])
             if (result === '__deadline__') {
-                console.error(`⏱️ A step took longer than ${HANDLER_DEADLINE_MS / 1000}s and was stopped (customer ${ctx.from}, message "${String(ctx.body).slice(0, 40)}")`)
+                console.error(`⏱️ A step took longer than ${HANDLER_DEADLINE_MS / 1000}s and was stopped (customer ${ctx.from}, message "${preview(ctx.body)}")`)
                 try {
                     await withTimeout(tools.flowDynamic('Sorry, that took longer than expected. Please send your message again.'), 5000)
                 } catch {
@@ -1124,7 +1167,7 @@ function guarded(fn) {
                 return tools.gotoFlow(orderCaptureFlow)
             }
             const ms = Date.now() - t0
-            if (ms > 10000) console.warn(`⏱️ Slow reply: ${(ms / 1000).toFixed(1)}s for customer ${ctx.from} ("${String(ctx.body).slice(0, 40)}")`)
+            if (ms > 10000) console.warn(`⏱️ Slow reply: ${(ms / 1000).toFixed(1)}s for customer ${ctx.from} ("${preview(ctx.body)}")`)
             return result
         } finally {
             clearTimeout(timer)
@@ -1205,8 +1248,31 @@ async function goTo(target, ctx, { gotoFlow, flowDynamic }) {
 // 🧾 INVOICES — created after the customer confirms payment
 // =============================================================
 const NOT_YET = /\b(not|haven'?t|hasn'?t|didn'?t|never)\b/i
+// Customers say they paid in many ways: "paid", "I have paid", "payment made", "I have sent it", "ive sent the money"...
 const looksPaid = (m) =>
-    /\b(paid|payment\s+(?:is\s+|has\s+been\s+)?(?:made|done|sent|complete[d]?)|(?:i|we)(?:\s+have|'ve|’ve)?\s+(?:already\s+)?(?:sent|transferred|made)\s+(?:the\s+)?(?:money|payment)|money\s+(?:sent|transferred)|sent\s+the\s+money)\b/i.test(m)
+    /\b(paid|payment\s+(?:is\s+|has\s+been\s+)?(?:made|done|sent|complete[d]?)|(?:i|we)(?:\s+have|'ve|’ve|ve)?\s+(?:already\s+)?(?:sent|transferred|made)\s+(?:it|the\s+(?:money|payment|amount)|payment|money)|money\s+(?:sent|transferred)|sent\s+the\s+money)\b/i.test(m)
+// Short answers that only count as "I paid" once the customer has been shown how to pay: "done", "sent", "I have sent it"
+const looksPaidWeak = (m) =>
+    /^\s*(?:ok(?:ay)?[\s,.!]+)?(?:(?:i|we)(?:\s+have|'ve|’ve|ve)?\s+)?(?:already\s+)?(?:done|sent(?:\s+it)?|transferred(?:\s+it)?)(?:[\s,.!]+(?:thanks?|thank\s+you|please|now|already))*[\s.!]*$/i.test(m)
+
+// A pasted Mobile Money confirmation SMS: it has words like "Transaction ID" / "Balance" / "Fee" and a long number
+const looksLikeTransaction = (m) => {
+    const t = String(m)
+    return t.length >= 25 &&
+        /(transaction|trans\.?\s*id|reference|\bref\b|financial|balance|fee\s+charged|payment\s+(?:for|of|made|received))/i.test(t) &&
+        /\d{6,}/.test(t)
+}
+// Reads the transaction ID and the amounts out of a pasted confirmation message
+function proofFromText(text) {
+    if (!looksLikeTransaction(text)) return null
+    const t = String(text)
+    const ref = /(?:transaction\s*(?:id|no|number)?|trans\.?\s*(?:id|no)|ref(?:erence)?(?:\s*(?:id|no|number))?)\s*[:#.\-]*\s*([A-Za-z0-9]{6,})/i.exec(t)
+    const amounts = [...t.matchAll(/(?:GH[S₵¢C]|₵)\s*([\d,]+(?:\.\d{1,2})?)/gi)]
+        .map((x) => Number(x[1].replace(/,/g, '')))
+        .filter((n) => Number.isFinite(n))
+    return { kind: 'text', text: t.slice(0, 600), reference: ref ? ref[1].slice(0, 40) : null, amounts }
+}
+const PROOF_REQUEST = '🙏 Thank you! To confirm your payment, please send your *Mobile Money transaction message* now: a screenshot, or paste the SMS text. Your invoice will be created as soon as we have it.'
 const looksConfirmed = (m) => /\b(confirm(?:ed)?(?:\s+my)?(?:\s+the)?\s+order|place\s+(?:my\s+|the\s+)?order|go\s+ahead|proceed)\b/i.test(m)
 
 const wantsInvoiceCopy = (m) => /\b(invoice|receipt)\b/i.test(m)
@@ -1214,10 +1280,14 @@ const looksCancel = (m) =>
     /\b(cancel(?:l?ed|l?ing)?|never\s*mind|forget\s+(?:it|about\s+it|the\s+order)|(?:i\s+)?(?:don'?t|do\s+not)\s+want\s+(?:it|this|the\s+order)(?:\s+any\s?more)?|stop\s+the\s+order)\b/i.test(m)
 
 const shouldInvoice = (userId, msg) => {
-    if (NOT_YET.test(msg)) return false
     const cart = getCart(userId)
+    const paysOnline = !!cart && !!cart.payment && cart.payment !== 'Cash on Delivery'
+    // the customer pastes the Mobile Money confirmation message after being shown how to pay
+    if (paysOnline && cart.proofExpected && looksLikeTransaction(msg)) return true
+    if (NOT_YET.test(msg)) return false
     if (!cart) return looksPaid(msg) || wantsInvoiceCopy(msg) // no open order: maybe re-send an existing invoice
     if (looksPaid(msg)) return true
+    if (paysOnline && cart.proofExpected && looksPaidWeak(msg)) return true // "done", "sent", "I have sent it"
     return cart.payment === 'Cash on Delivery' && looksConfirmed(msg)
 }
 
@@ -1232,7 +1302,7 @@ async function getDeliveryDetails(userId) {
         const customerText = history.filter((m) => m.role === 'user').map((m) => m.content).join('\n')
         if (!customerText) return {}
 
-        const res = await groq.chat.completions.create({
+        const res = await groqChat({
             model: 'openai/gpt-oss-20b',
             reasoning_effort: 'low',
             temperature: 0,
@@ -1413,9 +1483,10 @@ async function commitSale(userId, cart, { payMethod, paymentStatus, stamp }) {
         }
 
         const ins = await client.query(
-            `INSERT INTO invoices (user_id, customer_name, customer_phone, delivery_location, items, total, payment_method, payment_status)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
-            [userId, cart.customerName || null, userId, cart.location, JSON.stringify(lines), total, payMethod, paymentStatus]
+            `INSERT INTO invoices (user_id, customer_name, customer_phone, delivery_location, items, total, payment_method, payment_status, payment_proof, payment_reference)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id`,
+            [userId, cart.customerName || null, userId, cart.location, JSON.stringify(lines), total, payMethod, paymentStatus,
+                cart.proof ? (cart.proof.kind === 'text' ? cart.proof.text : '[screenshot sent in the chat]') : null, cart.proof?.reference || null]
         )
         const invoiceNo = `INV-${stamp}-${String(ins.rows[0].id).padStart(4, '0')}`
         await client.query('UPDATE invoices SET invoice_no = $1 WHERE id = $2', [invoiceNo, ins.rows[0].id])
@@ -1455,7 +1526,24 @@ async function issueInvoice(ctx, provider, flowDynamic) {
 
     const payMethod = cart.payment || 'Not specified'
     const isCash = payMethod === 'Cash on Delivery'
-    const paymentStatus = isCash ? 'Pay cash on delivery' : 'Payment confirmed by customer, being verified by our team'
+    const paymentStatus = isCash
+        ? 'Pay cash on delivery'
+        : !cart.payment
+            ? 'Payment confirmed by customer, being verified by our team'
+            : cart.proof
+                ? 'Proof of payment received, being verified by our team'
+                : 'Payment awaiting verification (no proof sent)'
+
+    // Has this transaction ID already been used on another invoice?
+    let duplicateOf = null
+    if (cart.proof?.reference) {
+        try {
+            const d = await pool.query("SELECT invoice_no FROM invoices WHERE payment_reference = $1 AND payment_status IS DISTINCT FROM 'Voided by owner' LIMIT 1", [cart.proof.reference])
+            duplicateOf = d.rows[0]?.invoice_no || null
+        } catch (err) {
+            console.warn('⚠️ Could not check the transaction ID:', err?.message)
+        }
+    }
     const now = new Date()
     const stamp = now.toLocaleDateString('en-CA', { timeZone: 'Africa/Accra' }).replace(/-/g, '')
     const phone = String(ctx.from).replace(/\D/g, '')
@@ -1490,12 +1578,30 @@ async function issueInvoice(ctx, provider, flowDynamic) {
     const alerts = []
     if (sale.partial) alerts.push('⚠️ PARTIAL ORDER: not everything the customer asked for was available. Please contact the customer.')
     for (const l of sale.lowStock) alerts.push(`📉 Low stock: ${l.item} — ${l.left} left`)
+
+    // What the customer sent as proof of payment (Mobile Money / card orders)
+    const proofNotes = []
+    if (!isCash && cart.payment) {
+        if (!cart.proof) {
+            alerts.push('⚠️ NO PROOF of payment was sent. Please check your Mobile Money statement before delivering.')
+        } else if (cart.proof.kind === 'screenshot') {
+            proofNotes.push('📷 The customer sent a screenshot in the chat. Please open the chat and compare it with your MoMo statement.')
+        } else {
+            proofNotes.push(`🧾 *Transaction message:* ${cart.proof.text.slice(0, 300)}`)
+            if (cart.proof.amounts?.length) {
+                if (cart.proof.amounts.some((a) => Math.abs(a - sale.total) < 0.01)) proofNotes.push('✅ An amount in the message matches the order total.')
+                else alerts.push(`⚠️ The amount(s) in the transaction message (${cart.proof.amounts.join(', ')}) do not match the order total ${money(sale.total)}.`)
+            }
+            if (duplicateOf) alerts.push(`⚠️ This transaction ID was already used on invoice ${duplicateOf}. Possible duplicate or fake proof.`)
+        }
+    }
     // The owner gets a short alert for every order. If the customer IS the owner (a test order), they already
     // see the invoice in this chat, so only real problems (low stock, partial order) are sent.
     if (OWNER_ORDER_ALERTS && !isOwner(ctx.from)) {
         notifyOwners(
             provider,
             `🔔 *New order ${sale.invoiceNo}*\n${sale.lines.map((l) => `${l.qty} × ${l.item}`).join('\n')}\n*Total:* ${money(sale.total)}\n*Payment:* ${payMethod} (${paymentStatus})\n*Customer:* +${phone}\n*Delivery:* ${cart.location}` +
+                (proofNotes.length ? '\n\n' + proofNotes.join('\n') : '') +
                 (alerts.length ? '\n\n' + alerts.join('\n') : '')
         )
     } else if (alerts.length) {
@@ -1511,7 +1617,7 @@ async function getRecentInvoice(userId) {
     try {
         const res = await pool.query(
             `SELECT invoice_no, customer_name, customer_phone, delivery_location, items, total, payment_method, payment_status, created_at
-             FROM invoices WHERE user_id = $1 AND created_at > NOW() - INTERVAL '24 hours' ORDER BY id DESC LIMIT 1`,
+             FROM invoices WHERE user_id = $1 AND created_at > NOW() - INTERVAL '24 hours' AND payment_status IS DISTINCT FROM 'Voided by owner' ORDER BY id DESC LIMIT 1`,
             [userId]
         )
         return res.rows[0] || null
@@ -1566,6 +1672,7 @@ async function getSalesForDate(date) {
                 to_char(created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Accra', 'HH24:MI') AS time_text
          FROM invoices
          WHERE (created_at AT TIME ZONE 'UTC' AT TIME ZONE 'Africa/Accra')::date = $1::date
+           AND payment_status IS DISTINCT FROM 'Voided by owner'
          ORDER BY id`,
         [date]
     )
@@ -2066,9 +2173,46 @@ function startHumanTakeoverWatcher(provider) {
     }, WATCH_INTERVAL_MS)
 }
 
-// Owner commands (sent from an owner number): pause 0241234567 | resume 0241234567 | resume all | paused
+// Owner command "void INV-20261028-0007": the payment never arrived, so the invoice is cancelled and its stock is put back
+async function voidInvoice(invoiceNo) {
+    const client = await pool.connect()
+    try {
+        await client.query('BEGIN')
+        await client.query("SET LOCAL lock_timeout = '4000'")
+        const found = await client.query('SELECT id, items, payment_status FROM invoices WHERE invoice_no = $1 FOR UPDATE', [invoiceNo])
+        if (!found.rows.length) {
+            await client.query('ROLLBACK')
+            return `❌ I could not find invoice ${invoiceNo}.`
+        }
+        const row = found.rows[0]
+        if (row.payment_status === VOIDED_STATUS) {
+            await client.query('ROLLBACK')
+            return `ℹ️ Invoice ${invoiceNo} was already voided.`
+        }
+        const lines = Array.isArray(row.items) ? row.items : JSON.parse(row.items || '[]')
+        for (const l of lines) {
+            const qty = Number(l.qty) || 0
+            if (qty > 0) {
+                await client.query('UPDATE inventory SET stock_quantity = stock_quantity + $1, updated_at = NOW() WHERE lower(item_name) = lower($2)', [qty, l.item])
+            }
+        }
+        await client.query('UPDATE invoices SET payment_status = $1 WHERE id = $2', [VOIDED_STATUS, row.id])
+        await client.query('COMMIT')
+        return `✅ Invoice ${invoiceNo} voided. Stock returned: ${lines.map((l) => `${l.qty} × ${l.item}`).join(', ')}. It no longer counts in your sales reports. The customer was not told.`
+    } catch (err) {
+        await client.query('ROLLBACK').catch(() => {})
+        console.error('❌ Could not void the invoice:', err.message)
+        return '❌ Sorry, I could not void that invoice. Please try again.'
+    } finally {
+        client.release()
+    }
+}
+
+// Owner commands (sent from an owner number): pause 0241234567 | resume 0241234567 | resume all | paused | void INV-20261028-0007
 async function handleOwnerCommand(text) {
     const t = String(text).trim()
+    const v = t.match(/^void\s+(INV-\d{8}-\d{1,6})$/i)
+    if (v) return await voidInvoice(v[1].toUpperCase())
     if (/^paused$/i.test(t)) {
         const now = Date.now()
         const list = [...pausedChats].filter(([, until]) => until > now)
@@ -2126,8 +2270,15 @@ const NON_TEXT_REPLIES = {
 }
 const lastNonTextAlert = new Map()
 
-async function handleNonText(ctx, { flowDynamic, provider }) {
+async function handleNonText(ctx, { flowDynamic, provider, gotoFlow }) {
     const kind = nonTextKind(ctx)
+
+    // A screenshot or file while the customer is expected to pay by Mobile Money / card = their proof of payment
+    const payCart = getCart(ctx.from)
+    if ((kind === 'media' || kind === 'document') && gotoFlow && payCart && payCart.proofExpected && payCart.payment && payCart.payment !== 'Cash on Delivery' && !payCart.proof) {
+        payCart.proof = { kind: 'screenshot' }
+        return gotoFlow(invoiceFlow)
+    }
 
     if (kind === 'location') {
         const pin = locationFromCtx(ctx)
@@ -2159,7 +2310,7 @@ async function handleNonText(ctx, { flowDynamic, provider }) {
 const orderCaptureFlow = addKeyword(EVENTS.ACTION)
     .addAction({ capture: true }, guarded(async (ctx, { provider, flowDynamic, gotoFlow }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
-        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
+        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider, gotoFlow })
         if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
         const nav = navigationTarget(ctx.body, 'order')
         if (nav) return goTo(nav, ctx, { gotoFlow, flowDynamic })
@@ -2180,7 +2331,7 @@ const orderPromptFlow = addKeyword(EVENTS.ACTION)
         { capture: true },
         guarded(async (ctx, { provider, flowDynamic, gotoFlow }) => {
             if (isPaused(ctx)) return notePausedMessage(ctx)
-            if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
+            if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider, gotoFlow })
             if (await tryOwnerCommand(ctx, { provider, flowDynamic })) return gotoFlow(orderCaptureFlow)
             if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
             const nav = navigationTarget(ctx.body, 'order')
@@ -2202,7 +2353,7 @@ const categorySelectionFlow = addKeyword(EVENTS.ACTION)
         { capture: true },
         guarded(async (ctx, { gotoFlow, provider, flowDynamic }) => {
             if (isPaused(ctx)) return notePausedMessage(ctx)
-            if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
+            if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider, gotoFlow })
             if (await tryOwnerCommand(ctx, { provider, flowDynamic })) return gotoFlow(orderCaptureFlow)
             const input = ctx.body.trim().toLowerCase()
             if (isGreeting(input)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
@@ -2257,7 +2408,7 @@ const retailFlow = addKeyword(EVENTS.ACTION)
         { capture: true },
         guarded(async (ctx, { gotoFlow, provider, flowDynamic }) => {
             if (isPaused(ctx)) return notePausedMessage(ctx)
-            if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
+            if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider, gotoFlow })
             if (await tryOwnerCommand(ctx, { provider, flowDynamic })) return gotoFlow(orderCaptureFlow)
             const selection = ctx.body.trim().toLowerCase()
             if (isGreeting(selection)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
@@ -2289,7 +2440,7 @@ const wholesaleFlow = addKeyword(EVENTS.ACTION)
         { capture: true },
         guarded(async (ctx, { gotoFlow, provider, flowDynamic }) => {
             if (isPaused(ctx)) return notePausedMessage(ctx)
-            if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
+            if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider, gotoFlow })
             if (await tryOwnerCommand(ctx, { provider, flowDynamic })) return gotoFlow(orderCaptureFlow)
             if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
             const nav = navigationTarget(ctx.body, 'wholesale')
@@ -2314,7 +2465,7 @@ const supportFlow = addKeyword(EVENTS.ACTION)
         { capture: true },
         guarded(async (ctx, { gotoFlow, provider, flowDynamic }) => {
             if (isPaused(ctx)) return notePausedMessage(ctx)
-            if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
+            if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider, gotoFlow })
             if (await tryOwnerCommand(ctx, { provider, flowDynamic })) return gotoFlow(orderCaptureFlow)
             if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
             const nav = navigationTarget(ctx.body, 'support')
@@ -2330,7 +2481,7 @@ const supportFlow = addKeyword(EVENTS.ACTION)
 const invoiceFlow = addKeyword(EVENTS.ACTION)
     .addAction(guarded(async (ctx, { provider, flowDynamic, gotoFlow }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
-        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
+        if (nonTextKind(ctx) && !getCart(ctx.from)?.proof) return handleNonText(ctx, { flowDynamic, provider, gotoFlow })
         const cart = getCart(ctx.from)
         if (!cart) {
             const resent = await resendLastInvoice(ctx, provider, flowDynamic)
@@ -2339,6 +2490,19 @@ const invoiceFlow = addKeyword(EVENTS.ACTION)
         }
 
         noteCartDetails(ctx.from, ctx.body)
+
+        // Mobile Money / card: ask for the transaction message once. A pasted SMS or a screenshot is accepted as proof.
+        // If the customer insists without proof, the invoice is still made but flagged for the owner.
+        if (cart.payment && cart.payment !== 'Cash on Delivery') {
+            const textProof = proofFromText(ctx.body)
+            if (textProof) cart.proof = textProof
+            if (!cart.proof && !cart.askedForProof) {
+                cart.askedForProof = true
+                cart.proofExpected = true
+                await flowDynamic(PROOF_REQUEST)
+                return gotoFlow(orderCaptureFlow)
+            }
+        }
 
         if (!cart.location) {
             const details = await getDeliveryDetails(ctx.from)
@@ -2365,7 +2529,7 @@ const deliveryDetailsFlow = addKeyword(EVENTS.ACTION)
                 if (cart) cart.location = pin
                 return gotoFlow(invoiceFlow)
             }
-            if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
+            if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider, gotoFlow })
             if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
             const cart = getCart(ctx.from)
             if (cart) cart.location = ctx.body.trim()
@@ -2376,7 +2540,7 @@ const deliveryDetailsFlow = addKeyword(EVENTS.ACTION)
 const cancelFlow = addKeyword(EVENTS.ACTION)
     .addAction(guarded(async (ctx, { provider, flowDynamic, gotoFlow }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
-        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
+        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider, gotoFlow })
         const cart = getCart(ctx.from)
         if (cart) {
             resetCustomer(ctx.from) // empties the order and gives the reserved items back
@@ -2413,7 +2577,7 @@ const welcomeFlow = addKeyword(EVENTS.ACTION)
         { capture: true },
         guarded(async (ctx, { gotoFlow, provider, flowDynamic }) => {
             if (isPaused(ctx)) return notePausedMessage(ctx)
-            if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
+            if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider, gotoFlow })
             if (await tryOwnerCommand(ctx, { provider, flowDynamic })) return gotoFlow(orderCaptureFlow)
             const userInput = ctx.body.trim().toLowerCase()
 
@@ -2438,7 +2602,7 @@ const welcomeFlow = addKeyword(EVENTS.ACTION)
 const globalFallbackFlow = addKeyword(EVENTS.WELCOME)
     .addAction(guarded(async (ctx, { provider, flowDynamic, gotoFlow }) => {
         if (isPaused(ctx)) return notePausedMessage(ctx)
-        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider })
+        if (nonTextKind(ctx)) return handleNonText(ctx, { flowDynamic, provider, gotoFlow })
         if (isGreeting(ctx.body)) { resetCustomer(ctx.from); return gotoFlow(welcomeFlow) }
         if (looksCancel(ctx.body)) return gotoFlow(cancelFlow)
         if (shouldInvoice(ctx.from, ctx.body)) return gotoFlow(invoiceFlow)
@@ -2490,7 +2654,7 @@ const main = async () => {
     // Log every message that reaches the bot. If a customer texts and you see NO "📩" line here,
     // the message never arrived (WhatsApp connection or login problem), so it is not a code problem.
     adapterProvider.on('message', (ctx) =>
-        console.log(`📩 Message received from ${ctx?.from}: ${String(ctx?.body || '').slice(0, 80)}`)
+        console.log(`📩 Message received from ${ctx?.from}: ${preview(ctx?.body, 80)}`)
     )
 
     // ---- Health endpoints (for UptimeRobot) ----
@@ -2639,7 +2803,7 @@ const main = async () => {
     // ---- Save unfinished orders every 5 seconds, and save everything when the host stops the bot ----
     setInterval(() => persistCarts().catch((err) => console.error('❌ Saving orders failed:', err.message)), 5000)
     setInterval(() => pool.query('DELETE FROM stock_holds WHERE expires_at < $1', [Date.now() - 86400000]).catch(() => {}), 60 * 60 * 1000)
-    const cleanOldChats = () => pool.query("DELETE FROM chat_history WHERE created_at < NOW() - INTERVAL '180 days'").catch((err) => console.error('❌ Could not clean old chats:', err.message))
+    const cleanOldChats = () => pool.query("DELETE FROM chat_history WHERE created_at < NOW() - INTERVAL '60 days'").catch((err) => console.error('❌ Could not clean old chats:', err.message))
     setTimeout(cleanOldChats, 5 * 60 * 1000) // once shortly after every start (the bot may restart more often than once a day)
     setInterval(cleanOldChats, 24 * 60 * 60 * 1000) // and then every day
     process.on('SIGTERM', async () => {
