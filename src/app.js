@@ -1081,7 +1081,7 @@ STRICT INSTRUCTIONS:
 12. If a customer wants to change an order, confirm the change. If they want to cancel an order that already has an invoice, tell them a team member will help them.
 13. Follow the NEXT STEP in the order section exactly, one step at a time. Do not skip ahead, and do not suggest other products while the customer is in the middle of an order.
 14. Keep every reply short and about the store only. If the customer wants to go back, change category or start over, tell them they can type *menu* at any time.
-15. NEVER repeat your previous reply word for word. If an item is out of stock, say so once, then help the customer choose something else. If the customer only says thanks, okay or sure, answer in one short friendly sentence and invite them to type an item name or *menu*. When an order has been invoiced it is finished: do not bring it up again unless the customer asks about it.
+15. NEVER repeat your previous reply word for word. If an item is out of stock, say so once, then help the customer choose something else. If the customer only says thanks, okay, thank you or sure, answer in one short friendly sentence and invite them to type an item name or *menu*. When an order has been invoiced it is finished: do not bring it up again unless the customer asks about it.
 `
 
         const chatCompletion = await timed('AI reply', groqChat({
