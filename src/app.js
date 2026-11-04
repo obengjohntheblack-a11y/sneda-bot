@@ -516,7 +516,7 @@ const money = (n) => {
     return `GH₵ ${whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}.${dec}`
 }
 
-// "thanks", "okay thanks", "bye" ... and plain "ok", "sure", "yes" when nothing is being ordered
+// "thanks", "thank you", "okay thanks", "bye" ... and plain "ok", "sure", "yes" when nothing is being ordered
 const THANKS_OR_BYE = /^\s*(?:(?:ok(?:ay)?|alright|all\s+right|fine|great|cool|nice|good|noted|got\s+it|sure)[\s,.!]+)?(?:thanks?|thank\s+you|thanx|thx|ty|bye|goodbye|see\s+you(?:\s+later)?|that'?s\s+all|nothing\s+else|i'?m\s+done|no\s+thanks?|no\s+thank\s+you)(?:[\s,.!]+(?:so\s+much|very\s+much|a\s+lot|again|please|bye|goodbye|thanks?|thank\s+you|ok(?:ay)?|then))*[\s.!]*$/i
 const AFFIRM_ONLY = /^\s*(?:ok(?:ay)?|alright|all\s+right|fine|great|cool|nice|good|noted|got\s+it|sure|yes|yeah|yep|yup|k)(?:[\s,.!]+(?:please|then|sure))*[\s.!]*$/i
 const closingKind = (m) => (THANKS_OR_BYE.test(m) ? 'thanks' : AFFIRM_ONLY.test(m) ? 'affirm' : null)
